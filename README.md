@@ -3,11 +3,19 @@
 Still in testing phase, but it is to the point where I was able to automate my technical documentation. 
 
 ## Installation Guide
-Users must have Python installed on their machine and the following dependencies:
+**Option A – Standalone .exe (no Python needed):** download `Auto-Scapture.exe` and double-click it. Your `settings.json` is saved next to the .exe.
+
+**Option B – Run from source:** install Python 3.9+ and the dependencies:
 ```
-pip install keyboard Pillow
+pip install -r requirements.txt
+python autocapture.py
 ```
-Within your Windows desktop, click Open with Python.
+
+**Building the .exe yourself:**
+```
+.\build_exe.ps1
+```
+The executable is written to `dist\Auto-Scapture.exe`.
 
 Because this application uses global hot keys, it may require Adminstrator privileges in order to run.
 
@@ -31,5 +39,5 @@ To expand the functionality for lab environments, a secondary module was impleme
 * **File Merger:** Combine multiple text or config files into one large master document, complete with generated visual dividers.
 
 ## IV. Notes & Reflection
-* The application is built entirely in Python using `Tkinter` for the GUI, `keyboard` for global hotkeys, and `Pillow` for image processing.
-* Your program should compile without any errors using PyInstaller to create a standalone `.exe` for daily use.
+* The application is built entirely in Python using `PySide6` (Qt) for the GUI (migrated from `Tkinter`), `keyboard` for global hotkeys, and `Pillow` for image processing.
+* The program compiles with PyInstaller (`build_exe.ps1`) into a single standalone `.exe` for daily use.
