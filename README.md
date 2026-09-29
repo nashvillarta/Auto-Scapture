@@ -3,7 +3,7 @@
 Still in testing phase, but it is to the point where I was able to automate my technical documentation. 
 
 ## Installation Guide
-**Option A – Standalone .exe (no Python needed):** download `Auto-Scapture.exe` and double-click it. Your `settings.json` is saved next to the .exe.
+**Option A – Standalone .exe (no Python needed):** download `Auto-Scapture.exe` and double-click it. Your `settings.json` (save folder, capture mode, presets, hotkeys, etc.) is saved next to the .exe.
 
 **Option B – Run from source:** install Python 3.9+ and the dependencies:
 ```
@@ -26,7 +26,7 @@ You are free to use this system for simple manual screen snipping. However, the 
 
 ## II. Capture System
 The core architecture of the application includes the following:
-* **Capture Modes:** Features Manual (Hotkey), Auto-Capture (Fixed Slide Count), and Smart Auto (Detects a target "End" slide to stop automatically).
+* **Capture Modes:** Features Manual (Hotkey), Auto-Capture (Fixed Slide Count), and Smart Auto (Detects a target "End" slide to stop automatically). Press **Esc** at any time to abort Auto/Smart capture, even while the slideshow has focus.
 * **Review & Redact Studio:** An interface to reorder the session queue, delete mistakes, and draw redaction boxes or add text labels to images.
 * **PDF Compiler:** Automatically compiles your active session of images into a single, clean PDF document.
 * **Area Presets:** Save and recall specific bounding box coordinates on your screen.
@@ -34,7 +34,8 @@ The core architecture of the application includes the following:
 ## III. Lab Renamer
 To expand the functionality for lab environments, a secondary module was implemented:
 * **Bulk Sequential Renamer:** Load `.txt`, `.cfg`, or `.csv` files, preview their contents, and rename them sequentially in bulk.
-* **Context Naming:** The app peeks inside files to find "Title" or "Experiment" headers and renames the file accordingly.
+* **Context Naming:** Tick "Context Naming" and the app peeks inside files to find "Title" or "Experiment" headers and renames the file accordingly.
+* **Safe Renaming:** Batch renames never silently overwrite files, handle overlapping names (e.g. shifting `a1..a3` to `a2..a4`), and report any failures.
 * **Format Conversion:** Manually edit or automatically batch-convert file extensions.
 * **File Merger:** Combine multiple text or config files into one large master document, complete with generated visual dividers.
 

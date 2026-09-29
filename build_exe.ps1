@@ -7,5 +7,7 @@ param([string]$Python = "python")
 & $Python -m PyInstaller --noconfirm --clean --onefile --windowed `
     --name Auto-Scapture `
     --version-file version.txt `
+    --icon assets\icon.ico `
+    --add-data "assets\icon.png;assets" `
     --exclude-module tkinter `
     autocapture.py

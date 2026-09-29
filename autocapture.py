@@ -10,7 +10,7 @@ import keyboard
 from PIL import ImageGrab, Image, ImageChops, ImageStat, ImageDraw, ImageFont
 
 from PySide6.QtCore import Qt, QObject, QTimer, Signal, QRect, QPoint, QSize
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPalette, QPen, QPixmap, QImage, QGuiApplication
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QKeySequence, QPainter, QPalette, QPen, QShortcut, QPixmap, QImage, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication, QWidget, QDialog, QTabWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QCheckBox, QRadioButton, QButtonGroup, QLineEdit, QComboBox,
@@ -20,6 +20,12 @@ from PySide6.QtWidgets import (
 )
 
 APP_TITLE = "Auto-Scapture Test Build (1.6.2)"
+
+
+def resource_path(rel):
+    """Locate bundled files both from source and inside a PyInstaller one-file build."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, rel)
 
 
 # ==========================================
@@ -316,6 +322,13 @@ class ScreenCaptureApp(QWidget):
 
         self.resize(480, self.sizeHint().height())
 
+        icon_file = resource_path(os.path.join("assets", "icon.png"))
+        if os.path.exists(icon_file):
+            self.setWindowIcon(QIcon(icon_file))
+
+        if prefs.get("pinned", False):
+            self.pin_btn.setChecked(True)
+
     def ui_call(self, fn):
         """Thread-safe: schedule fn on the GUI thread."""
         self.bridge.call.emit(fn)
@@ -347,7 +360,8 @@ class ScreenCaptureApp(QWidget):
         folder_frame = QHBoxLayout()
         folder_frame.setContentsMargins(10, 0, 10, 0)
         default_path = os.path.join(os.path.expanduser("~"), "Desktop", "AutoCaptures")
-        self.folder_entry = QLineEdit(default_path)
+        self.folder_entry = QLineEdit(self.settings_data.get("preferences", {}).get("save_folder") or default_path)
+        self.folder_entry.editingFinished.connect(self.scan_for_pdfs)
         folder_frame.addWidget(self.folder_entry)
         self.browse_btn = make_button("Browse", self.browse_folder)
         folder_frame.addWidget(self.browse_btn)
@@ -491,7 +505,8 @@ class ScreenCaptureApp(QWidget):
         else:
             self.name_combo.setEditText("Module1_")
         self.scan_for_pdfs()
-        self.mode_radios["Manual"].setChecked(True)
+        saved_mode = prefs.get("capture_mode", "Manual")
+        self.mode_radios.get(saved_mode, self.mode_radios["Manual"]).setChecked(True)
         self.update_mode_ui()
 
     def capture_mode(self):
@@ -587,6 +602,7 @@ class ScreenCaptureApp(QWidget):
         self.r_listbox = QListWidget()
         self.r_listbox.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.r_listbox.setFont(QFont("Arial", 10))
+        QShortcut(QKeySequence.Delete, self.r_listbox, self.remove_rename_item, context=Qt.WidgetShortcut)
         left.addWidget(self.r_listbox, 1)
 
         for fp in self.rename_files_list:
@@ -644,8 +660,11 @@ class ScreenCaptureApp(QWidget):
         self.rn_ext_combo.addItems(["Keep Original"] + self.renamer_extensions)
         self.rn_ext_combo.setMinimumWidth(120)
         rg.addWidget(self.rn_ext_combo, 0, 5)
+        self.rn_smart_cb = QCheckBox("🧠 Context Naming (use 'Title:' / 'Experiment:' header inside the file)")
+        self.rn_smart_cb.setStyleSheet("color: white;")
+        rg.addWidget(self.rn_smart_cb, 1, 0, 1, 6)
         rg.addWidget(make_button("APPLY RENAME & CONVERT TO ALL", lambda: self.execute_batch_rename(r_win),
-                                 bg="#4CAF50", fg="white", bold=True, point_size=10), 1, 0, 1, 6)
+                                 bg="#4CAF50", fg="white", bold=True, point_size=10), 2, 0, 1, 6)
         rg.setColumnStretch(1, 1)
         right.addWidget(rename_frame)
 
@@ -775,44 +794,82 @@ class ScreenCaptureApp(QWidget):
 
         if new_ext_val != "Keep Original" and not new_ext_val.startswith("."):
             new_ext_val = "." + new_ext_val
-        count = 0
 
-        rn_smart_cb = getattr(self, 'rn_smart_cb', None)
+        use_context = self.rn_smart_cb.isChecked()
+        plan = []
         for i, old_path in enumerate(self.rename_files_list):
             dir_n = os.path.dirname(old_path)
             ext = os.path.splitext(old_path)[1]
             final_ext = ext if new_ext_val == "Keep Original" else new_ext_val
             new_name = f"{base}{start_idx + i}{final_ext}"
 
-            if rn_smart_cb is not None and rn_smart_cb.isChecked() and final_ext.lower() in [".txt", ".cfg", ".log", ".md", ".csv", ".ini"]:
+            if use_context and ext.lower() in [".txt", ".cfg", ".log", ".md", ".csv", ".ini"]:
                 try:
                     with open(old_path, 'r', encoding='utf-8', errors='ignore') as f:
                         for _ in range(5):
                             line = f.readline()
                             m = re.search(r"(?:Title|Experiment|Lab|Name):\s*(.*)", line, re.I)
                             if m:
-                                clean = "".join(x for x in m.group(1).strip() if x.isalnum() or x in " -_")
+                                clean = "".join(x for x in m.group(1).strip() if x.isalnum() or x in " -_").strip()
                                 if clean:
                                     new_name = f"{clean}{final_ext}"
                                     break
                 except Exception as e:
                     print(f"Error reading file {old_path}: {e}")
 
-            new_path = os.path.join(dir_n, new_name)
+            plan.append((i, old_path, os.path.join(dir_n, new_name)))
+
+        # Refuse plans where two files would end up with the same name
+        seen, dups = set(), set()
+        for _, _, new_path in plan:
+            key = os.path.normcase(new_path)
+            if key in seen: dups.add(os.path.basename(new_path))
+            seen.add(key)
+        if dups:
+            error(window, "Name Collision", "These names would be used by more than one file:\n\n" + "\n".join(sorted(dups)[:10]))
+            return
+
+        # Warn before overwriting files that are not part of this batch
+        batch = {os.path.normcase(old) for _, old, _ in plan}
+        conflicts = [os.path.basename(n) for _, _, n in plan if os.path.normcase(n) not in batch and os.path.exists(n)]
+        if conflicts and not ask_yes_no(window, "Overwrite?", f"{len(conflicts)} file(s) already exist and will be overwritten:\n\n"
+                                        + "\n".join(conflicts[:10]) + "\n\nContinue?"):
+            return
+
+        # Two-phase rename so files can swap/shift names without clobbering each other
+        count, errors, staged = 0, [], []
+        for i, old_path, new_path in plan:
+            if old_path == new_path:
+                count += 1
+                continue
+            tmp_path = f"{old_path}.renaming{i}"
             try:
-                os.rename(old_path, new_path)
+                os.rename(old_path, tmp_path)
+                staged.append((i, old_path, tmp_path, new_path))
+            except Exception as e:
+                errors.append(f"{os.path.basename(old_path)}: {e}")
+
+        for i, old_path, tmp_path, new_path in staged:
+            try:
+                os.replace(tmp_path, new_path)
                 self.rename_files_list[i] = new_path
                 count += 1
             except Exception as e:
-                print(f"Failed to rename {old_path}: {e}")
+                errors.append(f"{os.path.basename(old_path)}: {e}")
+                try: os.rename(tmp_path, old_path)
+                except OSError: self.rename_files_list[i] = tmp_path
 
         if new_ext_val != "Keep Original" and new_ext_val not in self.renamer_extensions:
             self.renamer_extensions.append(new_ext_val)
             self.save_settings()
 
+        self.refresh_renamer_main_list()
+        if errors:
+            self._refresh_r_listbox()
+            warn(window, "Finished With Errors", f"Renamed {count} of {len(plan)} files.\n\nProblems:\n" + "\n".join(errors[:10]))
+            return
         info(window, "Success", f"Successfully renamed {count} files.")
         window.close()
-        self.refresh_renamer_main_list()
 
     def combine_files(self):
         parent = QApplication.activeWindow() or self
@@ -957,7 +1014,10 @@ class ScreenCaptureApp(QWidget):
                 "saved_filenames": self.saved_filenames,
                 "delay_min": self.auto_delay_min_entry.value(),
                 "delay_max": self.auto_delay_max_entry.value(),
-                "renamer_extensions": self.renamer_extensions
+                "renamer_extensions": self.renamer_extensions,
+                "save_folder": self.folder_entry.text(),
+                "capture_mode": self.capture_mode(),
+                "pinned": self.is_pinned
             }
         }
         try:
@@ -1107,6 +1167,7 @@ class ScreenCaptureApp(QWidget):
         self.is_pinned = checked
         self.setWindowFlag(Qt.WindowStaysOnTopHint, checked)
         self.show()
+        self.save_settings()
 
     def apply_preset(self, selected):
         if selected in self.presets:
@@ -1205,17 +1266,25 @@ class ScreenCaptureApp(QWidget):
                     self.is_listening = False
                     return
                 self.set_start_btn(f"Stop Listening ({custom_hotkey})", "red")
-            elif mode == "Auto":
-                self.set_start_btn("Stop Auto-Capture (Abort)", "red")
+            else:
+                # Global Esc works even while the slideshow has focus
+                self.abort_hotkey = keyboard.add_hotkey("esc", lambda: self.ui_call(self.abort_capture))
+
+            if mode == "Auto":
+                self.set_start_btn("Stop Auto-Capture (Esc / Click to Abort)", "red")
                 slides = self.auto_count_entry.value()
                 threading.Thread(target=self.run_auto_capture_thread, args=(slides, delay_min, delay_max, key), daemon=True).start()
             elif mode == "Smart":
-                self.set_start_btn("Stop Smart Capture (Abort)", "red")
+                self.set_start_btn("Stop Smart Capture (Esc / Click to Abort)", "red")
                 threading.Thread(target=self.run_smart_capture_thread, args=(delay_min, delay_max, key), daemon=True).start()
 
         else:
             self.is_listening = False
             self.toggle_ui_lock(lock=False)
+            if getattr(self, "abort_hotkey", None) is not None:
+                try: keyboard.remove_hotkey(self.abort_hotkey)
+                except (KeyError, ValueError): pass
+                self.abort_hotkey = None
             mode = self.capture_mode()
             if mode == "Manual":
                 try: keyboard.remove_hotkey(self.current_hotkey)
@@ -1225,6 +1294,10 @@ class ScreenCaptureApp(QWidget):
                 self.set_start_btn("2. Start Auto-Capture (3s Delay)")
             elif mode == "Smart":
                 self.set_start_btn("2. Start Smart Capture (3s Delay)")
+
+    def abort_capture(self):
+        if self.is_listening and self.capture_mode() in ("Auto", "Smart"):
+            self.toggle_listening()
 
     def compare_images(self, img1, img2, tolerance=2.0):
         i1 = img1.resize((100, 100)).convert("L")
@@ -1247,7 +1320,7 @@ class ScreenCaptureApp(QWidget):
         for i in range(max_slides):
             if not self.is_listening: break
 
-            self.ui_call(lambda curr=i+1: self.start_btn.setText(f"Scanning Slide {curr} - Click to Stop"))
+            self.ui_call(lambda curr=i+1: self.start_btn.setText(f"Scanning Slide {curr} - Esc to Stop"))
             current_img = ImageGrab.grab(bbox=self.capture_region)
 
             is_match = self.compare_images(current_img, self.reference_end_image)
@@ -1302,7 +1375,7 @@ class ScreenCaptureApp(QWidget):
         for i in range(slides):
             if not self.is_listening: break
 
-            self.ui_call(lambda curr=i+1, total=slides: self.start_btn.setText(f"Capturing {curr}/{total} - Click to Stop"))
+            self.ui_call(lambda curr=i+1, total=slides: self.start_btn.setText(f"Capturing {curr}/{total} - Esc to Stop"))
             self.ui_call(lambda: self.take_screenshot(is_auto=True))
             time.sleep(0.3)
 
@@ -1468,6 +1541,11 @@ class ScreenCaptureApp(QWidget):
         btn_grid.addWidget(make_button("⬆ Up", lambda: move(lambda i, n: max(i - 1, 0))), 0, 0)
         btn_grid.addWidget(make_button("⬇ Down", lambda: move(lambda i, n: min(i + 1, n - 1))), 0, 1)
         btn_grid.addWidget(make_button("❌ Del", remove_item, fg="red"), 0, 2)
+        def confirm_remove():
+            n = len(self._selected_rows(listbox))
+            if n and ask_yes_no(review_win, "Delete?", f"Delete {n} selected image(s) from disk?"):
+                remove_item()
+        QShortcut(QKeySequence.Delete, listbox, confirm_remove, context=Qt.WidgetShortcut)
         btn_grid.addWidget(make_button("⇈ Top", lambda: move(lambda i, n: 0)), 1, 0)
         btn_grid.addWidget(make_button("⇊ Bot", lambda: move(lambda i, n: n - 1)), 1, 1)
         btn_grid.addWidget(make_button("⇄ Rev", reverse_list), 1, 2)
@@ -1589,7 +1667,9 @@ class ScreenCaptureApp(QWidget):
                     state['texts'].pop()
                 canvas.update()
 
-        top_bar.addWidget(make_button("↩️ Undo Last", undo_last))
+        top_bar.addWidget(make_button("↩️ Undo Last (Ctrl+Z)", undo_last))
+        QShortcut(QKeySequence.Undo, redact_win, undo_last)
+        QShortcut(QKeySequence.Save, redact_win, save_redactions)
         top_bar.addWidget(make_button(f"💾 Save to {len(filepaths)} Image(s)", save_redactions, bg="#4CAF50", fg="white", bold=True, point_size=10))
 
         redact_win.show()
@@ -1719,6 +1799,7 @@ class ScreenCaptureApp(QWidget):
             error(self, "Error", f"Could not create PDF:\n{str(e)}\n\nTry ensuring all images in the session still exist in the folder.")
 
     def closeEvent(self, event):
+        self.save_settings()
         self.is_listening = False
         try: keyboard.unhook_all()
         except Exception: pass
