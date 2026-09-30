@@ -6,6 +6,7 @@ import time
 import random
 import re # Added for the smart renamer context peek
 import ctypes
+import array
 import math
 import io
 import struct
@@ -14,14 +15,14 @@ import zlib
 import keyboard
 from PIL import ImageGrab, Image, ImageChops, ImageStat, ImageDraw, ImageFont
 
-from PySide6.QtCore import Qt, QObject, QTimer, Signal, QRect, QPoint, QSize, QUrl
+from PySide6.QtCore import Qt, QObject, QTimer, Signal, QRect, QPoint, QSize, QUrl, QByteArray
 from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QIcon, QKeySequence, QPainter, QPalette, QPen, QShortcut, QPixmap, QImage, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication, QWidget, QDialog, QTabWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QCheckBox, QRadioButton, QButtonGroup, QLineEdit, QComboBox,
     QSpinBox, QDoubleSpinBox, QGroupBox, QListWidget, QListWidgetItem, QAbstractItemView, QFrame,
     QPlainTextEdit, QScrollArea, QStackedWidget, QMessageBox, QInputDialog,
-    QFileDialog, QColorDialog, QSlider, QSplitter, QStyle, QSizePolicy,
+    QFileDialog, QColorDialog, QSlider, QSplitter, QStyle, QSizePolicy, QStyleOptionSlider,
 )
 
 # Qt's FFmpeg engine opens MOV/MP4/MKV/WEBM/AVI alike and seeks accurately; the Windows Media
@@ -29,7 +30,7 @@ from PySide6.QtWidgets import (
 os.environ.setdefault("QT_MEDIA_BACKEND", "ffmpeg")
 
 try:  # Video Capture tab needs the QtMultimedia add-on (FFmpeg backend, hardware decoding where available)
-    from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QMediaMetaData
+    from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QMediaMetaData, QAudioDecoder, QAudioFormat
     from PySide6.QtMultimediaWidgets import QVideoWidget
     VIDEO_AVAILABLE = True
 except ImportError:
@@ -584,6 +585,131 @@ def format_clock(ms, with_ms=False, hours=False):
     return text + (f".{rem_ms:03d}" if with_ms else "")
 
 
+class ClickSlider(QSlider):
+    """Slider that jumps straight to wherever you click (and then lets you drag)."""
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self.maximum() > self.minimum():
+            opt = QStyleOptionSlider()
+            self.initStyleOption(opt)
+            groove = self.style().subControlRect(QStyle.CC_Slider, opt, QStyle.SC_SliderGroove, self)
+            handle = self.style().subControlRect(QStyle.CC_Slider, opt, QStyle.SC_SliderHandle, self)
+            span = max(1, groove.width() - handle.width())
+            x = int(event.position().x()) - groove.x() - handle.width() // 2
+            self.setValue(QStyle.sliderValueFromPosition(self.minimum(), self.maximum(), x, span))
+        super().mousePressEvent(event)  # the handle is now under the cursor, so dragging continues
+
+
+WAVE_BIN_MS = 50  # one loudness sample per 50 ms of audio
+
+
+class WaveformWidget(QWidget):
+    """Loudness chart of the video's audio. Click or drag on it to seek."""
+    seekRequested = Signal(int)  # absolute player position (ms)
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(56)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("Audio loudness - click to jump there")
+        self.reset()
+
+    def reset(self, message="Analyzing audio..."):
+        self.bins = []          # peak level (0-32767) per WAVE_BIN_MS, on the file's clock
+        self.start_ms = 0
+        self.duration_ms = 0
+        self.position_ms = 0
+        self.message = message
+        self._cache_key = None
+        self._columns = []
+        self.update()
+
+    def set_timeline(self, start_ms, duration_ms):
+        if (start_ms, duration_ms) != (self.start_ms, self.duration_ms):
+            self.start_ms, self.duration_ms = start_ms, duration_ms
+            self.update()
+
+    def set_position(self, pos_ms):
+        self.position_ms = pos_ms
+        self.update()
+
+    def add_samples(self, start_ms, samples, sample_rate):
+        per_bin = max(1, int(sample_rate * WAVE_BIN_MS / 1000))
+        for i in range(0, len(samples), per_bin):
+            chunk = samples[i:i + per_bin]
+            if not chunk:
+                continue
+            peak = max(max(chunk), -min(chunk))
+            idx = int((start_ms + i * 1000.0 / sample_rate) / WAVE_BIN_MS)
+            if idx >= len(self.bins):
+                self.bins.extend([0] * (idx + 1 - len(self.bins)))
+            if peak > self.bins[idx]:
+                self.bins[idx] = peak
+        self.message = ""
+
+    def finish(self):
+        if not any(self.bins):
+            self.message = "No audio track"
+        self._cache_key = None
+        self.update()
+
+    def _level(self, peak):
+        # Show loudness on a 60 dB scale so quiet speech and loud parts are both visible
+        if peak <= 0:
+            return 0.0
+        db = 20 * math.log10(peak / 32768.0)
+        return min(1.0, max(0.0, (db + 60) / 60))
+
+    def _column_levels(self, width):
+        key = (width, len(self.bins), self.start_ms, self.duration_ms, sum(self.bins[-50:]))
+        if key != self._cache_key:
+            self._cache_key = key
+            cols = []
+            if self.duration_ms > 0 and self.bins:
+                for x in range(width):
+                    a = int((self.start_ms + self.duration_ms * x / width) / WAVE_BIN_MS)
+                    b = max(a + 1, int((self.start_ms + self.duration_ms * (x + 1) / width) / WAVE_BIN_MS))
+                    seg = self.bins[a:b]
+                    cols.append(self._level(max(seg)) if seg else 0.0)
+            self._columns = cols
+        return self._columns
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = self.rect()
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#111827"))
+        p.drawRoundedRect(r, 6, 6)
+        cols = self._column_levels(r.width())
+        mid = r.height() / 2
+        play_x = int((self.position_ms - self.start_ms) / self.duration_ms * r.width()) if self.duration_ms else -1
+        played, unplayed = QPen(QColor("#60a5fa")), QPen(QColor("#4b5563"))
+        for x, level in enumerate(cols):
+            h = max(1.0, level * (r.height() - 8) / 2)
+            p.setPen(played if x <= play_x else unplayed)
+            p.drawLine(x, int(mid - h), x, int(mid + h))
+        if self.message:
+            p.setPen(QColor("#9ca3af"))
+            p.drawText(r, Qt.AlignCenter, self.message)
+        if 0 <= play_x <= r.width():
+            p.setPen(QPen(QColor("white"), 2))
+            p.drawLine(play_x, 2, play_x, r.height() - 2)
+
+    def _seek_from(self, event):
+        if self.duration_ms > 0:
+            frac = min(1.0, max(0.0, event.position().x() / max(1, self.width())))
+            self.seekRequested.emit(int(self.start_ms + frac * self.duration_ms))
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._seek_from(event)
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.LeftButton:
+            self._seek_from(event)
+
+
 class VideoCaptureTab(QWidget):
     """Media player for grabbing native-resolution frames and building YouTube chapter timestamps."""
 
@@ -644,12 +770,18 @@ class VideoCaptureTab(QWidget):
         self.stack.setMinimumSize(480, 270)
         pc.addWidget(self.stack, 1)
 
-        self.slider = QSlider(Qt.Horizontal)
+        self.slider = ClickSlider(Qt.Horizontal)
         self.slider.setEnabled(False)
         self.slider.sliderPressed.connect(self._slider_pressed)
         self.slider.sliderMoved.connect(self.player.setPosition)
         self.slider.sliderReleased.connect(self._slider_released)
         pc.addWidget(self.slider)
+
+        self.wave = WaveformWidget()
+        self.wave.reset("Open a video to see its audio")
+        self.wave.seekRequested.connect(self.seek_to)
+        pc.addWidget(self.wave)
+        self.decoder = None
 
         self.time_lbl = QLabel("00:00.000 / 00:00.000")
         self.time_lbl.setFont(QFont("Consolas", 10))
@@ -784,6 +916,7 @@ class VideoCaptureTab(QWidget):
         self._meta_fps = None
         self._prime_state = "waiting"
         self.player.setSource(QUrl.fromLocalFile(path))
+        self._analyze_audio(path)
 
     def _on_status(self, status):
         if status == QMediaPlayer.LoadedMedia and self.video_path and self._prime_state == "waiting":
@@ -893,7 +1026,56 @@ class VideoCaptureTab(QWidget):
         self.slider.setRange(self._start_ms, max(self._start_ms, duration))
         self._update_time_label(self.player.position())
 
+    def _analyze_audio(self, path):
+        """Decode the audio track in the background into a loudness chart (low sample rate, mono)."""
+        if self.decoder is not None:
+            self.decoder.stop()
+            self.decoder.deleteLater()
+        self.wave.reset()
+        self.decoder = QAudioDecoder(self)
+        fmt = QAudioFormat()
+        fmt.setSampleRate(4000)
+        fmt.setChannelCount(1)
+        fmt.setSampleFormat(QAudioFormat.Int16)
+        self.decoder.setAudioFormat(fmt)
+        dec = self.decoder
+        def on_buffer():
+            if dec is not self.decoder: return
+            buf = dec.read()
+            if not buf.isValid(): return
+            f = buf.format()
+            if f.sampleFormat() != QAudioFormat.Int16 or f.channelCount() != 1:
+                return
+            self.wave.add_samples(buf.startTime() / 1000.0, array.array("h", bytes(buf.constData())), f.sampleRate())
+        dec.bufferReady.connect(on_buffer)
+        self._wave_timer = getattr(self, "_wave_timer", None) or QTimer(self)
+        self._wave_timer.setInterval(300)
+        try: self._wave_timer.timeout.disconnect()
+        except (RuntimeError, TypeError): pass
+        self._wave_timer.timeout.connect(self.wave.update)
+        self._wave_timer.start()
+        def done():
+            if dec is self.decoder:
+                self._wave_timer.stop()
+                self.wave.finish()
+        dec.finished.connect(done)
+        dec.error.connect(lambda _e: dec is self.decoder and self.wave.reset("No audio track"))
+        dec.setSource(QUrl.fromLocalFile(path))
+        dec.start()
+
+    def seek_to(self, pos_ms):
+        """Jump to an absolute position (from the loudness chart)."""
+        if not self.video_path: return
+        self._end_priming()
+        pos_ms = min(max(self._start_ms, pos_ms), self.player.duration())
+        if self.player.playbackState() == QMediaPlayer.PlayingState:
+            self.player.setPosition(pos_ms)
+        else:
+            self.snap_to_frame(pos_ms)
+
     def _on_position(self, pos):
+        self.wave.set_timeline(self._start_ms, self.duration_ms())
+        self.wave.set_position(pos)
         if self.slider.minimum() != self._start_ms:
             self.slider.setRange(self._start_ms, max(self._start_ms, self.player.duration()))
             self._update_info()
@@ -965,7 +1147,8 @@ class VideoCaptureTab(QWidget):
     def _slider_released(self):
         if self._was_playing:
             self.player.setPosition(self.slider.value())
-            self.player.play()
+            # Resuming in the same instant as the seek can make the player drop the seek
+            QTimer.singleShot(80, self.player.play)
         else:
             self.snap_to_frame(self.slider.value())
 
@@ -1099,6 +1282,8 @@ class VideoCaptureTab(QWidget):
 
     def shutdown(self):
         self.player.stop()
+        if self.decoder is not None:
+            self.decoder.stop()
 
 
 # ==========================================
@@ -1156,10 +1341,23 @@ class ScreenCaptureApp(QWidget):
         self.notebook = QTabWidget()
         outer.addWidget(self.notebook)
 
+        # The capture tab is a centred column that scrolls if the window is short, so all tabs can
+        # share one window size (nothing resizes when switching tabs).
         self.cap_tab = QWidget()
+        self.cap_tab.setMaximumWidth(620)
+        cap_holder = QWidget()
+        holder_lay = QHBoxLayout(cap_holder)
+        holder_lay.setContentsMargins(0, 0, 0, 0)
+        holder_lay.addStretch(1)
+        holder_lay.addWidget(self.cap_tab, 100)
+        holder_lay.addStretch(1)
+        cap_scroll = QScrollArea()
+        cap_scroll.setWidgetResizable(True)
+        cap_scroll.setFrameShape(QFrame.NoFrame)
+        cap_scroll.setWidget(cap_holder)
         self.rename_tab = QWidget()
 
-        self.notebook.addTab(self.cap_tab, "Auto-Scapture")
+        self.notebook.addTab(cap_scroll, "Auto-Scapture")
         self.notebook.addTab(self.rename_tab, "Lab Renamer")
 
         self.setup_capture_ui()
@@ -1169,13 +1367,19 @@ class ScreenCaptureApp(QWidget):
         if VIDEO_AVAILABLE:
             self.video_tab = VideoCaptureTab(self)
             self.notebook.addTab(self.video_tab, "Video Capture")
-        self._tab_sizes = {}
-        self._current_tab = 0
-        self._apply_tab_size_policies(0)
-        self.notebook.currentChanged.connect(self._on_tab_changed)
 
         self.setAcceptDrops(True)
-        self.resize(520, self.sizeHint().height())
+        # One window for every tab: restore the last size/position (and maximised state) if saved
+        geometry = self.settings_data.get("window_geometry")
+        restored = False
+        if geometry:
+            try:
+                restored = self.restoreGeometry(QByteArray.fromBase64(geometry.encode("ascii")))
+            except Exception:
+                restored = False
+        if not restored:
+            avail = self.screen().availableGeometry()
+            self.resize(min(1100, avail.width() - 40), min(900, avail.height() - 40))
 
         icon_file = resource_path(os.path.join("assets", "icon.png"))
         if os.path.exists(icon_file):
@@ -1189,30 +1393,6 @@ class ScreenCaptureApp(QWidget):
         # Only hide the window while a capture is running, so screen sharing (Discord, Teams, OBS)
         # can still see Auto-Scapture the rest of the time.
         exclude_from_capture(self, self.hide_from_capture and self.is_listening)
-
-    def _apply_tab_size_policies(self, index):
-        """Only the visible tab counts toward the window's minimum size (so the narrow capture
-        tab isn't forced to be as wide as the video player)."""
-        for i in range(self.notebook.count()):
-            policy = QSizePolicy.Preferred if i == index else QSizePolicy.Ignored
-            self.notebook.widget(i).setSizePolicy(policy, policy)
-        self.notebook.updateGeometry()
-
-    def _on_tab_changed(self, index):
-        # Each tab remembers its own window size; the video tab opens roomy by default
-        self._tab_sizes[self._current_tab] = self.size()
-        self._current_tab = index
-        self._apply_tab_size_policies(index)
-        if index in self._tab_sizes:
-            target = self._tab_sizes[index]
-        elif self.notebook.widget(index) is self.video_tab:
-            avail = self.screen().availableGeometry()
-            target = QSize(min(1180, avail.width() - 40), min(760, avail.height() - 60))
-        else:
-            return
-        # Let the layout drop the previous tab's minimum size before resizing
-        self.layout().activate()
-        QTimer.singleShot(0, lambda: self.resize(target))
 
     def ui_call(self, fn):
         """Thread-safe: schedule fn on the GUI thread."""
@@ -1980,6 +2160,7 @@ class ScreenCaptureApp(QWidget):
         data = {
             "presets": self.presets,
             "video_chapters": self.video_chapters,
+            "window_geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
             "preferences": {
                 "auto_open_pdf": self.auto_open_pdf,
                 "continuous_capture": self.cont_cb.isChecked(),

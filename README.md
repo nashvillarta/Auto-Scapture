@@ -39,7 +39,8 @@ The core architecture of the application includes the following:
 
 ## III. Video Capture
 A built-in media player tab for pulling documentation screenshots out of recordings:
-* **Scrub & Step:** Play/pause, seek bar, +/- 5 s jumps, playback speed, and exact frame-by-frame stepping (Left/Right arrows). Uses Qt's FFmpeg backend with hardware video decoding where your device supports it.
+* **Scrub & Step:** Play/pause, a seek bar you can click anywhere on, +/- 5 s jumps, playback speed, and exact frame-by-frame stepping (Left/Right arrows).
+* **Audio Loudness Chart:** A waveform of the video's audio under the seek bar shows loud and quiet parts at a glance; click it to jump there. Uses Qt's FFmpeg backend with hardware video decoding where your device supports it; works with MP4, MOV (incl. iPhone HEVC), MKV, WEBM and AVI.
 * **Native-Resolution Frame Capture:** "Capture Frame" (C) saves the decoded video frame itself at the video's native resolution, with no player controls or screen scaling in the shot. Frames join the current session, so Review, duplicate flags, PDF and Markdown export all work as usual.
 * **YouTube Timestamps:** Add titled timestamps (M) at the current position, jump to / rename / move / delete them, and export a ready-to-paste YouTube chapters `.txt` (or copy it). YouTube's rules (first stamp at 0:00, at least 3 stamps, 10 s minimum) are checked for you, and timestamps are remembered per video.
 
