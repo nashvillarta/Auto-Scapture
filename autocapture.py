@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QCheckBox, QRadioButton, QButtonGroup, QLineEdit, QComboBox,
     QSpinBox, QDoubleSpinBox, QGroupBox, QListWidget, QListWidgetItem, QAbstractItemView, QFrame,
     QPlainTextEdit, QScrollArea, QStackedWidget, QMessageBox, QInputDialog,
-    QFileDialog, QColorDialog, QSlider, QSplitter, QStyle, QSizePolicy, QStyleOptionSlider,
+    QFileDialog, QColorDialog, QSlider, QSplitter, QStyle, QSizePolicy, QStyleOptionSlider, QLayout,
 )
 
 # Qt's FFmpeg engine opens MOV/MP4/MKV/WEBM/AVI alike and seeks accurately; the Windows Media
@@ -365,6 +365,8 @@ QPushButton { background: #ffffff; border: 1px solid #c9d1db; border-radius: 6px
 QPushButton:hover { background: #f0f4fa; border-color: #8fa5c0; }
 QPushButton:pressed { background: #e2e9f3; }
 QPushButton:disabled { color: #a0a7b1; background: #f3f4f6; border-color: #e1e5ea; }
+QPushButton:checked { background: #dbe8fd; border-color: #1f6feb; color: #0b2a5b; }
+QFrame#miniPanel { background: #ffffff; }
 QLineEdit { border: 1px solid #c9d1db; border-radius: 5px; padding: 4px 6px; background: #ffffff; }
 QLineEdit:focus { border: 1px solid #1f6feb; }
 QLineEdit:disabled { background: #f3f4f6; color: #9ca3af; }
@@ -1337,6 +1339,7 @@ class ScreenCaptureApp(QWidget):
         # --- TABBED INTERFACE ---
         # ==========================================
         outer = QVBoxLayout(self)
+        self._outer = outer
         outer.setContentsMargins(0, 0, 0, 0)
         self.notebook = QTabWidget()
         outer.addWidget(self.notebook)
@@ -1368,6 +1371,14 @@ class ScreenCaptureApp(QWidget):
             self.video_tab = VideoCaptureTab(self)
             self.notebook.addTab(self.video_tab, "Video Capture")
 
+        self._apply_tab_size_policies(0)
+        self.notebook.currentChanged.connect(self._apply_tab_size_policies)
+        QShortcut(QKeySequence("Ctrl+M"), self, self.toggle_minimal)
+        if self.view_size == "minimal":
+            self._enter_minimal()
+            self.set_status(self._status_text)
+        self._sync_view_buttons()
+
         self.setAcceptDrops(True)
         # One window for every tab: restore the last size/position (and maximised state) if saved
         geometry = self.settings_data.get("window_geometry")
@@ -1394,6 +1405,241 @@ class ScreenCaptureApp(QWidget):
         # can still see Auto-Scapture the rest of the time.
         exclude_from_capture(self, self.hide_from_capture and self.is_listening)
 
+    # ==========================================
+    # --- LAYOUT MODES (Regular / Minimal x Vertical / Horizontal) ---
+    # ==========================================
+    def _view_key(self):
+        return f"{self.view_size}-{self.view_orientation}"
+
+    def _apply_tab_size_policies(self, index):
+        """Only the visible tab sets the window's minimum size, so the Auto-Scapture tab can be
+        made small even though the video player needs more room. (Switching tabs never resizes the
+        window unless it's too small for the new tab.)"""
+        for i in range(self.notebook.count()):
+            policy = QSizePolicy.Preferred if i == index else QSizePolicy.Ignored
+            self.notebook.widget(i).setSizePolicy(policy, policy)
+        self.notebook.updateGeometry()
+
+    def _take(self, widget):
+        """Detach a widget from whatever layout currently holds it (so it can be moved)."""
+        for lay in self.findChildren(QLayout):
+            if lay.indexOf(widget) >= 0:
+                lay.removeWidget(widget)
+                return
+
+    def _arrange_capture_tab(self):
+        """(Re)build the regular Auto-Scapture tab in the current orientation using the existing cards."""
+        cards = [self._top_row_w, self._header_w, self.setup_box, self.area_box, self.mode_frame, self.start_btn, self.session_box]
+        for w in cards:
+            self._take(w)
+        host = QWidget()
+        if self.view_orientation == "horizontal":
+            v = QVBoxLayout(host)
+            v.setContentsMargins(12, 8, 12, 10)
+            v.setSpacing(4)
+            v.addWidget(self._top_row_w)
+            row = QHBoxLayout()
+            row.setSpacing(12)
+            col1, col2, col3 = QVBoxLayout(), QVBoxLayout(), QVBoxLayout()
+            col1.addWidget(self._header_w)
+            col1.addWidget(self.setup_box)
+            col1.addStretch()
+            col2.addWidget(self.area_box)
+            col2.addWidget(self.mode_frame)
+            col2.addSpacing(4)
+            col2.addWidget(self.start_btn)
+            col2.addStretch()
+            col3.addWidget(self.session_box)
+            col3.addStretch()
+            for c in (col1, col2, col3):
+                row.addLayout(c, 1)
+            v.addLayout(row)
+            v.addStretch()
+            self.cap_tab.setMaximumWidth(16777215)
+        else:
+            v = QVBoxLayout(host)
+            v.setContentsMargins(12, 8, 12, 10)
+            v.setSpacing(4)
+            for w in (self._top_row_w, self._header_w, self.setup_box, self.area_box, self.mode_frame):
+                v.addWidget(w)
+            v.addSpacing(6)
+            v.addWidget(self.start_btn)
+            v.addWidget(self.session_box)
+            v.addStretch()
+            self.cap_tab.setMaximumWidth(620)
+        old = self._cap_host
+        self.cap_tab.layout().addWidget(host)
+        self._cap_host = host
+        if old is not None:
+            self.cap_tab.layout().removeWidget(old)
+            old.deleteLater()
+
+    # widgets shared between the regular tab and the minimal controller
+    def _shared_widgets(self):
+        return [self.pin_btn, self.select_btn, self.show_area_btn, self.capture_now_btn, self.status_label,
+                self.start_btn, self.last_thumb, self.session_label, self.flag_label, self.review_btn]
+
+    def _enter_minimal(self):
+        self.notebook.setCurrentIndex(0)
+        for w in self._shared_widgets():
+            self._take(w)
+        panel = QFrame()
+        panel.setObjectName("miniPanel")
+        self.mini_mode_combo = QComboBox()
+        self.mini_mode_combo.addItems(["Manual", "Auto", "Smart"])
+        self.mini_mode_combo.setCurrentText(self.capture_mode())
+        self.mini_mode_combo.setToolTip("Capture mode (set slide count, delay and target in the full view)")
+        self.mini_mode_combo.currentTextChanged.connect(lambda t: self.mode_radios[t].setChecked(True))
+        self.mini_mode_combo.setEnabled(not self.is_listening)
+        full_btn = make_button("Full View", lambda: self.set_view(size="regular"))
+        full_btn.setToolTip("Back to the full window  (Ctrl+M)")
+        other = "horizontal" if self.view_orientation == "vertical" else "vertical"
+        rotate_btn = make_button(other.capitalize(), lambda: self.set_view(orientation=other))
+        rotate_btn.setToolTip(f"Lay the compact controller out {other}ly")
+        self.last_thumb.setFixedSize(80, 45)
+        self.pin_btn.setText("Pin")
+        self.select_btn.setText("Select Area")
+
+        if self.view_orientation == "horizontal":
+            # one slim strip
+            lay = QHBoxLayout(panel)
+            lay.setContentsMargins(8, 6, 8, 6)
+            lay.setSpacing(6)
+            for w in (self.pin_btn, self.select_btn, self.show_area_btn):
+                lay.addWidget(w)
+            lay.addWidget(self.status_label, 0, Qt.AlignVCenter)
+            lay.addSpacing(6)
+            lay.addWidget(self.mini_mode_combo)
+            lay.addWidget(self.start_btn)
+            lay.addWidget(self.capture_now_btn)
+            lay.addSpacing(6)
+            lay.addWidget(self.last_thumb)
+            col = QVBoxLayout()
+            col.setSpacing(0)
+            col.addWidget(self.session_label)
+            col.addWidget(self.flag_label)
+            lay.addLayout(col)
+            self.review_btn.hide()  # kept to the vertical controller / full view to keep the strip short
+            lay.addSpacing(6)
+            lay.addWidget(rotate_btn)
+            lay.addWidget(full_btn)
+        else:
+            # small column for a screen corner
+            lay = QVBoxLayout(panel)
+            lay.setContentsMargins(8, 6, 8, 8)
+            lay.setSpacing(6)
+            top = QHBoxLayout()
+            top.addWidget(self.pin_btn)
+            top.addStretch()
+            top.addWidget(rotate_btn)
+            top.addWidget(full_btn)
+            lay.addLayout(top)
+            lay.addWidget(self.status_label, alignment=Qt.AlignHCenter)
+            r1 = QHBoxLayout()
+            r1.addWidget(self.select_btn, 1)
+            r1.addWidget(self.show_area_btn)
+            lay.addLayout(r1)
+            r2 = QHBoxLayout()
+            r2.addWidget(self.mini_mode_combo, 1)
+            r2.addWidget(self.capture_now_btn)
+            lay.addLayout(r2)
+            lay.addWidget(self.start_btn)
+            r3 = QHBoxLayout()
+            r3.addWidget(self.last_thumb)
+            col = QVBoxLayout()
+            col.setSpacing(0)
+            col.addStretch()
+            col.addWidget(self.session_label)
+            col.addWidget(self.flag_label)
+            col.addStretch()
+            r3.addLayout(col, 1)
+            lay.addLayout(r3)
+            self.review_btn.show()
+            lay.addWidget(self.review_btn)
+
+        self.flag_label.setWordWrap(False)
+        self.notebook.hide()
+        self._outer.addWidget(panel)
+        self.mini_panel = panel
+        self.update_session_label()
+
+    def _leave_minimal(self):
+        for w in self._shared_widgets():
+            self._take(w)
+        # put every shared widget back exactly where it lives in the regular tab
+        self._top_frame.insertWidget(0, self.pin_btn)
+        self._area_row.insertWidget(0, self.select_btn, 1)
+        self._area_row.insertWidget(1, self.show_area_btn)
+        self._area_row.insertWidget(2, self.capture_now_btn)
+        self._area_lay.insertWidget(1, self.status_label, 0, Qt.AlignHCenter)
+        self._info_row.insertWidget(0, self.last_thumb)
+        self._info_col.insertWidget(1, self.session_label)
+        self._info_col.insertWidget(2, self.flag_label)
+        self._btns.addWidget(self.review_btn, 0, 1)
+        self.last_thumb.setFixedSize(112, 63)
+        self.pin_btn.setText("Pin Window")
+        self.select_btn.setText("1. Select Screen Area")
+        self.review_btn.show()
+        self.flag_label.setWordWrap(True)
+        if self.mini_panel is not None:
+            self._outer.removeWidget(self.mini_panel)
+            self.mini_panel.deleteLater()
+        self.mini_panel = None
+        self.mini_mode_combo = None
+        self.notebook.show()
+        self._arrange_capture_tab()  # also re-inserts the start button
+        self.update_session_label()
+
+    def _sync_view_buttons(self):
+        self.vert_btn.setChecked(self.view_orientation == "vertical")
+        self.horiz_btn.setChecked(self.view_orientation == "horizontal")
+
+    def toggle_minimal(self):
+        self.set_view(size="regular" if self.view_size == "minimal" else "minimal")
+
+    def set_view(self, size=None, orientation=None):
+        size = size or self.view_size
+        orientation = orientation or self.view_orientation
+        if (size, orientation) == (self.view_size, self.view_orientation):
+            self._sync_view_buttons()
+            return
+        # each layout remembers its own window size and position
+        self._view_geoms[self._view_key()] = bytes(self.saveGeometry().toBase64()).decode("ascii")
+        was_minimal = self.view_size == "minimal"
+        if was_minimal:
+            self._leave_minimal()
+        self.view_size, self.view_orientation = size, orientation
+        if size == "minimal":
+            self._enter_minimal()
+        else:
+            self._arrange_capture_tab()
+        self._sync_view_buttons()
+        self.update_session_label()
+        self.set_status(getattr(self, "_status_text", "Area: Not Selected"))
+        self._apply_tab_size_policies(self.notebook.currentIndex())
+        QTimer.singleShot(0, self._restore_view_geometry)
+        self.save_settings()
+
+    def _restore_view_geometry(self):
+        saved = self._view_geoms.get(self._view_key())
+        if saved:
+            try:
+                if self.restoreGeometry(QByteArray.fromBase64(saved.encode("ascii"))):
+                    return
+            except Exception:
+                pass
+        if self.isMaximized() or self.isFullScreen():
+            self.showNormal()
+        self.layout().activate()
+        avail = self.screen().availableGeometry()
+        if self.view_size == "minimal":
+            self.resize(self.minimumSizeHint())
+        elif self.view_orientation == "horizontal":
+            content_h = self._cap_host.sizeHint().height() + self.notebook.tabBar().sizeHint().height() + 8
+            self.resize(min(1300, avail.width() - 40), min(content_h, avail.height() - 40))
+        else:
+            self.resize(min(1100, avail.width() - 40), min(900, avail.height() - 40))
+
     def ui_call(self, fn):
         """Thread-safe: schedule fn on the GUI thread."""
         self.bridge.call.emit(fn)
@@ -1403,9 +1649,12 @@ class ScreenCaptureApp(QWidget):
     # ==========================================
     def setup_capture_ui(self):
         prefs = self.settings_data.get("preferences", {})
-        lay = QVBoxLayout(self.cap_tab)
-        lay.setContentsMargins(12, 8, 12, 10)
-        lay.setSpacing(4)
+        self.view_size = prefs.get("view_size", "regular")              # regular | minimal
+        self.view_orientation = prefs.get("view_orientation", "vertical")  # vertical | horizontal
+        self._view_geoms = dict(self.settings_data.get("view_geometries", {}))
+        cap_outer = QVBoxLayout(self.cap_tab)
+        cap_outer.setContentsMargins(0, 0, 0, 0)
+        self._cap_host = None
         center = Qt.AlignHCenter
 
         top_frame = QHBoxLayout()
@@ -1414,8 +1663,23 @@ class ScreenCaptureApp(QWidget):
         top_frame.addWidget(self.pin_btn)
         top_frame.addStretch()
         self.settings_btn = make_button("Preferences", self.open_settings_window)
+        # Layout switches: Vertical / Horizontal, and Minimal (compact controller for pinning)
+        self.vert_btn = make_button("Vertical", lambda: self.set_view(orientation="vertical"))
+        self.horiz_btn = make_button("Horizontal", lambda: self.set_view(orientation="horizontal"))
+        self.mini_btn = make_button("Minimal", lambda: self.set_view(size="minimal"))
+        self.mini_btn.setToolTip("Switch to a compact controller you can pin over your slides  (Ctrl+M)")
+        for b in (self.vert_btn, self.horiz_btn):
+            b.setCheckable(True)
+            b.setToolTip("Arrange the controls " + b.text().lower() + "ly")
+        top_frame.addWidget(self.vert_btn)
+        top_frame.addWidget(self.horiz_btn)
+        top_frame.addSpacing(6)
+        top_frame.addWidget(self.mini_btn)
+        top_frame.addSpacing(6)
         top_frame.addWidget(self.settings_btn)
-        lay.addLayout(top_frame)
+        self._top_frame = top_frame
+        self._top_row_w = QWidget()
+        self._top_row_w.setLayout(top_frame)
 
         header = QHBoxLayout()
         header.addStretch()
@@ -1436,7 +1700,8 @@ class ScreenCaptureApp(QWidget):
         title_col.addWidget(subtitle)
         header.addLayout(title_col)
         header.addStretch()
-        lay.addLayout(header)
+        self._header_w = QWidget()
+        self._header_w.setLayout(header)
 
         # --- Session setup card ---
         setup_box = QGroupBox("Session Setup")
@@ -1481,7 +1746,7 @@ class ScreenCaptureApp(QWidget):
             grid.addWidget(field, row * 2 + 1, 0, 1, 2)
             grid.addWidget(b1, row * 2 + 1, 2)
             grid.addWidget(b2, row * 2 + 1, 3)
-        lay.addWidget(setup_box)
+        self.setup_box = setup_box
 
         # --- Capture area card ---
         area_box = QGroupBox("Capture Area")
@@ -1500,7 +1765,7 @@ class ScreenCaptureApp(QWidget):
         self.status_label = QLabel()
         self.status_label.setAlignment(Qt.AlignCenter)
         area_lay.addWidget(self.status_label, alignment=center)
-        lay.addWidget(area_box)
+        self.area_box, self._area_lay, self._area_row = area_box, area_lay, area_row
 
         # --- Capture mode card ---
         mode_frame = QGroupBox("Capture Mode")
@@ -1565,13 +1830,11 @@ class ScreenCaptureApp(QWidget):
         self.cont_cb.setChecked(prefs.get("continuous_capture", False))
         self.cont_cb.toggled.connect(self.save_settings)
         mode_lay.addWidget(self.cont_cb)
-        lay.addWidget(mode_frame)
+        self.mode_frame = mode_frame
 
-        lay.addSpacing(6)
         self.start_btn = make_button("2. Start Capture Sequence", self.toggle_listening, bg=PRIMARY, fg="white", bold=True, point_size=10)
         self.start_btn.setMinimumHeight(38)
         self.start_btn.setEnabled(False)
-        lay.addWidget(self.start_btn)
 
         # --- Session card ---
         session_box = QGroupBox("Session")
@@ -1615,8 +1878,11 @@ class ScreenCaptureApp(QWidget):
         btns.addWidget(self.clear_btn, 1, 1)
         btns.addWidget(self.pdf_btn, 2, 0, 1, 2)
         sess.addLayout(btns)
-        lay.addWidget(session_box)
-        lay.addStretch()
+        self.session_box = session_box
+        self._info_row, self._info_col, self._btns = info_row, info_col, btns
+        self.mini_panel = None
+        self.mini_mode_combo = None
+        self._arrange_capture_tab()
 
         if self.saved_filenames:
             self.name_combo.setEditText(self.saved_filenames[0])
@@ -2161,6 +2427,7 @@ class ScreenCaptureApp(QWidget):
             "presets": self.presets,
             "video_chapters": self.video_chapters,
             "window_geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
+            "view_geometries": self._view_geoms,
             "preferences": {
                 "auto_open_pdf": self.auto_open_pdf,
                 "continuous_capture": self.cont_cb.isChecked(),
@@ -2171,6 +2438,8 @@ class ScreenCaptureApp(QWidget):
                 "renamer_extensions": self.renamer_extensions,
                 "save_folder": self.folder_entry.text(),
                 "capture_mode": self.capture_mode(),
+                "view_size": self.view_size,
+                "view_orientation": self.view_orientation,
                 "pinned": self.is_pinned,
                 "play_sound": self.play_sound,
                 "hide_from_capture": self.hide_from_capture,
@@ -2187,6 +2456,14 @@ class ScreenCaptureApp(QWidget):
 
     def set_status(self, text):
         has_area = self.capture_region is not None
+        self._status_text = text
+        if getattr(self, "view_size", "regular") == "minimal":
+            # the compact controller only has room for the size
+            if has_area:
+                x1, y1, x2, y2 = self.capture_region
+                text = f"{x2 - x1} × {y2 - y1} px"
+            else:
+                text = "No area selected"
         self.status_label.setText(text)
         if has_area:
             self.status_label.setStyleSheet("background: #e6f4ea; color: #1e7e34; border-radius: 10px; padding: 3px 12px;")
@@ -2196,6 +2473,10 @@ class ScreenCaptureApp(QWidget):
         self.capture_now_btn.setEnabled(has_area and not (self.is_listening and self.capture_mode() != "Manual"))
 
     def update_mode_ui(self):
+        if self.mini_mode_combo is not None and self.mini_mode_combo.currentText() != self.capture_mode():
+            self.mini_mode_combo.blockSignals(True)
+            self.mini_mode_combo.setCurrentText(self.capture_mode())
+            self.mini_mode_combo.blockSignals(False)
         for w in self.dyn_widgets:
             self.dyn_grid.removeWidget(w)
             w.hide()
@@ -2459,6 +2740,8 @@ class ScreenCaptureApp(QWidget):
 
         for rb in self.mode_radios.values():
             rb.setEnabled(enabled)
+        if self.mini_mode_combo is not None:
+            self.mini_mode_combo.setEnabled(enabled)
 
     def set_start_btn(self, text, color=None):
         """color is passed while a capture is running; the button turns red as a stop button."""
@@ -2738,14 +3021,18 @@ class ScreenCaptureApp(QWidget):
 
     def update_session_label(self):
         n = len(self.session_images)
-        self.session_label.setText(f"Images in current session: {n}")
         flagged = len(self.flagged_in_session())
-        self.flag_label.setText(f"{flagged} possible duplicate(s) flagged - check Review / Redact")
+        if getattr(self, "view_size", "regular") == "minimal":
+            self.session_label.setText(f"{n} image(s)")
+            self.flag_label.setText(f"{flagged} flagged")
+        else:
+            self.session_label.setText(f"Images in current session: {n}")
+            self.flag_label.setText(f"{flagged} possible duplicate(s) flagged - check Review / Redact")
         self.flag_label.setVisible(flagged > 0)
         pix = QPixmap(self.session_images[-1]) if n else QPixmap()
         if pix.isNull():
             self.last_thumb.setPixmap(QPixmap())
-            self.last_thumb.setText("No captures yet")
+            self.last_thumb.setText("No captures" if getattr(self, "view_size", "regular") == "minimal" else "No captures yet")
         else:
             self.last_thumb.setPixmap(pix.scaled(self.last_thumb.size() - QSize(4, 4), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 

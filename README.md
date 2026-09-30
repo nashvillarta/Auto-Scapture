@@ -27,6 +27,7 @@ You are free to use this system for simple manual screen snipping. However, the 
 ## II. Capture System
 The core architecture of the application includes the following:
 * **Capture Modes:** Features Manual (Hotkey), Auto-Capture (Fixed Slide Count), and Smart Auto (Detects a target "End" slide to stop automatically). Press **Esc** at any time to abort Auto/Smart capture, even while the slideshow has focus.
+* **Layouts for Any Screen:** Switch the Auto-Scapture tab between **Vertical** and **Horizontal** (side-by-side columns), or go **Minimal** (Ctrl+M) for a compact controller you can pin over your slides - as a small box or a slim strip. Each layout remembers its own window size and position.
 * **Smart Slide Handling:** Auto/Smart modes can skip duplicate slides (when a key press didn't change the screen) and Auto mode can stop by itself when the deck ends.
 * **Multi-Monitor Area Selection:** Select a capture area on any monitor (or across monitors); "Show" briefly outlines the area and "Capture Now" takes a one-off shot.
 * **Invisible to Itself:** Auto-Scapture's window and capture pop-ups are hidden from its own screenshots (toggle in Preferences), so a pinned window never ends up in your slides.
