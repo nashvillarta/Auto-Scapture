@@ -1,6 +1,8 @@
 # Auto-Scapture
 "Purely for vibes :) "
 
+**Version 1.7.0**
+
 A Windows desktop tool for automating technical documentation: capture slide decks and lab walkthroughs, pull frames out of recordings, manage everyday screenshots, and export everything as clean PDFs or Markdown.
 
 Still in the testing phase, but it is to the point where I was able to automate my own technical documentation with it.

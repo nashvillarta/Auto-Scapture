@@ -42,7 +42,8 @@ try:  # Video Capture tab needs the QtMultimedia add-on (FFmpeg backend, hardwar
 except ImportError:
     VIDEO_AVAILABLE = False
 
-APP_TITLE = "Auto-Scapture Test Build (1.6.2)"
+APP_VERSION = "1.7.0"  # keep in sync with version.txt (build_exe.ps1 checks this)
+APP_TITLE = f"Auto-Scapture v{APP_VERSION}"
 
 
 def resource_path(rel):
