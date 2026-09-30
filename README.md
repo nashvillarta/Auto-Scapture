@@ -27,8 +27,14 @@ You are free to use this system for simple manual screen snipping. However, the 
 ## II. Capture System
 The core architecture of the application includes the following:
 * **Capture Modes:** Features Manual (Hotkey), Auto-Capture (Fixed Slide Count), and Smart Auto (Detects a target "End" slide to stop automatically). Press **Esc** at any time to abort Auto/Smart capture, even while the slideshow has focus.
-* **Review & Redact Studio:** An interface to reorder the session queue, delete mistakes, and draw redaction boxes or add text labels to images.
-* **PDF Compiler:** Automatically compiles your active session of images into a single, clean PDF document.
+* **Smart Slide Handling:** Auto/Smart modes can skip duplicate slides (when a key press didn't change the screen) and Auto mode can stop by itself when the deck ends.
+* **Multi-Monitor Area Selection:** Select a capture area on any monitor (or across monitors); "Show" briefly outlines the area and "Capture Now" takes a one-off shot.
+* **Invisible to Itself:** Auto-Scapture's window and capture pop-ups are hidden from its own screenshots (toggle in Preferences), so a pinned window never ends up in your slides.
+* **Review & Redact Studio:** A thumbnail queue with drag-and-drop reordering, double-click to redact, copy-to-clipboard, and redaction boxes / text labels (Ctrl+Z to undo).
+* **Lossless PDF Compiler:** Compiles your session into a single PDF with every screenshot embedded pixel-for-pixel at full resolution (no JPEG blur), optionally on A4/Letter pages with crisp text page numbers. 200-slide decks export in well under a second.
+* **Duplicate Flags:** Captures that are nearly identical to the one before (e.g. taken before a slide finished changing) are flagged in the pop-up, the session panel and Review, with one-click "Select Flagged", "Unflag" and "Scan Again". Exports warn you before including them.
+* **Markdown Export:** Writes a step-by-step `.md` document (one heading + image per step) ready for wikis, GitHub or Obsidian.
+* **Drag & Drop:** Drop images onto the window to add them to the session, or files onto the Lab Renamer tab.
 * **Area Presets:** Save and recall specific bounding box coordinates on your screen.
 
 ## III. Lab Renamer
