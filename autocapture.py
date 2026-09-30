@@ -24,6 +24,10 @@ from PySide6.QtWidgets import (
     QFileDialog, QColorDialog, QSlider, QSplitter, QStyle, QSizePolicy,
 )
 
+# Qt's FFmpeg engine opens MOV/MP4/MKV/WEBM/AVI alike and seeks accurately; the Windows Media
+# Foundation engine can't open MKV and is unreliable with some files, so always prefer FFmpeg.
+os.environ.setdefault("QT_MEDIA_BACKEND", "ffmpeg")
+
 try:  # Video Capture tab needs the QtMultimedia add-on (FFmpeg backend, hardware decoding where available)
     from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QMediaMetaData
     from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -562,6 +566,7 @@ class RedactionCanvas(QWidget):
 # ==========================================
 # --- VIDEO CAPTURE TAB ---
 # ==========================================
+STANDARD_FPS = (23.976, 24.0, 25.0, 29.97, 30.0, 48.0, 50.0, 59.94, 60.0, 90.0, 100.0, 119.88, 120.0, 144.0, 240.0)
 VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".wmv", ".flv", ".mpg", ".mpeg", ".ts")
 
 
@@ -589,7 +594,9 @@ class VideoCaptureTab(QWidget):
         self.fps = 30.0
         self.last_frame = None
         self.chapters = []           # [[ms, title], ...]
-        self._priming = False
+        self._prime_state = "done"   # waiting -> playing -> settling -> verifying -> done
+        self._start_ms = 0           # timeline position of the first frame (some files don't start at 0)
+        self._muted_before = False
         self._was_playing = False
 
         self.player = QMediaPlayer(self)
@@ -604,7 +611,7 @@ class VideoCaptureTab(QWidget):
         self.player.durationChanged.connect(self._on_duration)
         self.player.positionChanged.connect(self._on_position)
         self.player.playbackStateChanged.connect(self._on_state)
-        self.player.errorOccurred.connect(lambda _e, msg: msg and warn(self, "Video Error", msg))
+        self.player.errorOccurred.connect(self._on_error)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 8, 12, 10)
@@ -772,104 +779,195 @@ class VideoCaptureTab(QWidget):
         self.chapters = [list(c) for c in self.app.video_chapters.get(path, [])]
         self.refresh_chapters()
         self.stack.setCurrentWidget(self.video)
+        self._start_ms = 0
+        self._prime_times = []
+        self._meta_fps = None
+        self._prime_state = "waiting"
         self.player.setSource(QUrl.fromLocalFile(path))
 
     def _on_status(self, status):
-        if status == QMediaPlayer.LoadedMedia and self.video_path:
+        if status == QMediaPlayer.LoadedMedia and self.video_path and self._prime_state == "waiting":
             md = self.player.metaData()
             fps = md.value(QMediaMetaData.VideoFrameRate)
-            self.fps = float(fps) if fps and float(fps) > 0 else 30.0
+            self._meta_fps = float(fps) if fps and float(fps) > 0 else None
+            self.fps = self._meta_fps or 30.0
             res = md.value(QMediaMetaData.Resolution)
-            res_txt = f"{res.width()} x {res.height()}" if res and res.width() > 0 else "unknown size"
-            self.info_lbl.setText(f"{res_txt}  •  {self.fps:g} fps  •  {format_clock(self.player.duration())}")
+            self._res_txt = f"{res.width()} x {res.height()}" if res and res.width() > 0 else "unknown size"
+            self._update_info()
             self._set_controls_enabled(True)
-            # Decode the first frame so there is something to see / capture before pressing Play
-            self._priming = True
+            # Qt only decodes frames once playback starts, so play muted until the first frame
+            # arrives, then pause on it. This runs exactly once per opened video.
+            self._prime_state = "playing"
             self._muted_before = self.audio.isMuted()
             self.audio.setMuted(True)
             self.player.play()
         elif status == QMediaPlayer.InvalidMedia:
+            self._prime_state = "done"
             self.info_lbl.setText("Could not open this file")
             self._set_controls_enabled(False)
+
+    def _on_error(self, _err, msg):
+        # Some files have a track Qt can't decode (e.g. Opus audio in WEBM) but the video still plays.
+        # Only interrupt the user if no picture ever shows up.
+        self._last_error = msg or "Unknown error"
+        def check():
+            if self.last_frame is None:
+                warn(self, "Video Error", f"This video couldn't be played:\n\n{self._last_error}")
+            else:
+                self._update_info()
+                self.info_lbl.setText(self.info_lbl.text() + "  •  audio track not supported")
+                self.info_lbl.setToolTip(self._last_error)
+        QTimer.singleShot(2500, check)
+
+    def _update_info(self):
+        self.info_lbl.setText(f"{getattr(self, '_res_txt', '')}  •  {self.fps:g} fps  •  {format_clock(self.duration_ms())}")
 
     def _on_frame(self, frame):
         if not frame.isValid():
             return
         self.last_frame = frame
-        if self._priming:
-            self._priming = False
-            # Pausing from inside the player's own frame callback can leave its clock running,
-            # so finish priming once control is back in the event loop.
-            # Also give the decoder a moment to fully start, otherwise the pause may not stick.
+        if self._prime_state in ("playing", "settling"):
+            self._prime_times.append(frame.startTime())
+        if self._prime_state == "playing":
+            self._prime_state = "settling"
+            # The first decoded frame marks where the video really starts on the file's clock
+            start = frame.startTime()
+            self._start_ms = max(0, start // 1000) if 0 <= start < 60 * 60 * 1000 * 1000 else 0
+            # Pausing inside the player's own callback (or too early) may not stick, so wait a moment
             QTimer.singleShot(200, self._finish_priming)
 
     def _finish_priming(self, attempt=0):
+        if self._prime_state not in ("settling", "verifying"):
+            return  # the user already took over (pressed play, seeked, stepped...)
+        if attempt == 0:
+            self._apply_measured_fps()
+        self._prime_state = "verifying"
         self.player.pause()
-        self.player.setPosition(0)
-        # Safety check: a paused player's position must not keep moving
-        def verify():
-            if self.player.playbackState() != QMediaPlayer.PlayingState and self.player.position() > 150 and attempt < 3:
-                self.player.play()
-                QTimer.singleShot(150, lambda: self._finish_priming(attempt + 1))
-            else:
-                self.audio.setMuted(self._muted_before)
-        QTimer.singleShot(400, verify)
+        self.player.setPosition(self._start_ms)
+        # A paused player must not move. Judge by movement, never by absolute position,
+        # because some files (e.g. MOV/MKV with start offsets) don't begin at 0 ms.
+        def first_read():
+            if self._prime_state != "verifying": return
+            p1 = self.player.position()
+            def second_read():
+                if self._prime_state != "verifying": return
+                if self.player.position() - p1 > 40 and attempt < 3:
+                    self.player.play()
+                    QTimer.singleShot(150, lambda: self._finish_priming(attempt + 1))
+                else:
+                    self._end_priming()
+            QTimer.singleShot(250, second_read)
+        QTimer.singleShot(200, first_read)
+
+    def _apply_measured_fps(self):
+        """Many screen recordings (MKV, variable frame rate) carry no frame-rate metadata, so measure
+        it from the frames decoded while loading and prefer it when metadata is missing or off."""
+        times = sorted(set(t for t in self._prime_times if t >= 0))
+        if len(times) < 4:
+            return
+        measured = 1e6 * (len(times) - 1) / (times[-1] - times[0])  # average over the whole sample
+        if not 1 <= measured <= 240:
+            return
+        # Container timestamps are often rounded to 1 ms, so snap to the nearest standard rate
+        standard = min(STANDARD_FPS, key=lambda r: abs(r - measured))
+        if abs(standard - measured) / standard < 0.015:
+            measured = standard
+        if self._meta_fps is None or abs(measured - self._meta_fps) / self._meta_fps > 0.1:
+            self.fps = round(measured, 3)
+            self._update_info()
+
+    def _end_priming(self):
+        if self._prime_state != "done":
+            self._prime_state = "done"
+            self.audio.setMuted(self._muted_before)
+            self._on_state(self.player.playbackState())
+
+    def duration_ms(self):
+        """Length of the video itself (excluding any start offset)."""
+        return max(0, self.player.duration() - self._start_ms)
+
+    def rel(self, pos):
+        return max(0, pos - self._start_ms)
 
     def _on_duration(self, duration):
-        self.slider.setRange(0, max(0, duration))
+        self.slider.setRange(self._start_ms, max(self._start_ms, duration))
         self._update_time_label(self.player.position())
 
     def _on_position(self, pos):
+        if self.slider.minimum() != self._start_ms:
+            self.slider.setRange(self._start_ms, max(self._start_ms, self.player.duration()))
+            self._update_info()
         if not self.slider.isSliderDown():
             self.slider.setValue(pos)
         self._update_time_label(pos)
 
     def _update_time_label(self, pos):
         frame_no = self.current_frame_index(pos) + 1
-        self.time_lbl.setText(f"{format_clock(pos, True)} / {format_clock(self.player.duration(), True)}    Frame {frame_no}")
+        self.time_lbl.setText(f"{format_clock(self.rel(pos), True)} / {format_clock(self.duration_ms(), True)}    Frame {frame_no}")
 
     def _on_state(self, state):
-        playing = state == QMediaPlayer.PlayingState and not self._priming
+        playing = state == QMediaPlayer.PlayingState and self._prime_state == "done"
         self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPause if playing else QStyle.SP_MediaPlay))
 
     # ---------------- transport ----------------
     def current_frame_index(self, pos=None):
         pos = self.player.position() if pos is None else pos
-        return math.floor(pos * self.fps / 1000.0 + 1e-6)
+        # A position exactly on a frame boundary still shows the earlier frame, so lean backwards slightly
+        return max(0, math.floor((self.rel(pos) - 0.5) * self.fps / 1000.0))
 
     def toggle_play(self):
         if not self.video_path: return
+        self._end_priming()
         if self.player.playbackState() == QMediaPlayer.PlayingState:
             self.player.pause()
+            self.snap_to_frame()
         else:
             if self.player.position() >= self.player.duration() - 50:
-                self.player.setPosition(0)
+                self.player.setPosition(self._start_ms)
             self.player.play()
 
     def step_frame(self, direction):
         if not self.video_path: return
+        self._end_priming()
         self.player.pause()
-        last_index = max(0, math.ceil(self.player.duration() * self.fps / 1000.0) - 1)
+        last_index = max(0, math.ceil(self.duration_ms() * self.fps / 1000.0) - 1)
         idx = min(max(0, self.current_frame_index() + direction), last_index)
-        # Aim for the middle of the target frame so rounding can never land on a neighbour
-        self.player.setPosition(int(round((idx + 0.5) * 1000.0 / self.fps)))
+        self.player.setPosition(self.frame_center(idx))
+
+    def frame_center(self, idx):
+        # The middle of a frame is never ambiguous, unlike a position exactly on a frame boundary
+        return self._start_ms + int(round((idx + 0.5) * 1000.0 / self.fps))
+
+    def snap_to_frame(self, pos=None):
+        """While paused, move to the centre of the frame at pos so the picture on screen and the
+        frame counter always agree (frame stepping then moves exactly one frame)."""
+        pos = self.player.position() if pos is None else pos
+        self.player.setPosition(self.frame_center(self.current_frame_index(pos)))
 
     def jump(self, delta_ms):
         if not self.video_path: return
-        self.player.setPosition(min(max(0, self.player.position() + delta_ms), self.player.duration()))
+        self._end_priming()
+        target = min(max(self._start_ms, self.player.position() + delta_ms), self.player.duration())
+        if self.player.playbackState() == QMediaPlayer.PlayingState:
+            self.player.setPosition(target)
+        else:
+            self.snap_to_frame(target)
 
     def toggle_mute(self):
         self.audio.setMuted(not self.audio.isMuted())
         self.mute_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaVolumeMuted if self.audio.isMuted() else QStyle.SP_MediaVolume))
 
     def _slider_pressed(self):
+        self._end_priming()
         self._was_playing = self.player.playbackState() == QMediaPlayer.PlayingState
         self.player.pause()
 
     def _slider_released(self):
-        self.player.setPosition(self.slider.value())
         if self._was_playing:
+            self.player.setPosition(self.slider.value())
             self.player.play()
+        else:
+            self.snap_to_frame(self.slider.value())
 
     # ---------------- capture ----------------
     def capture_frame(self):
@@ -893,7 +991,7 @@ class VideoCaptureTab(QWidget):
 
     def refresh_chapters(self, select_ms=None):
         self.chapters.sort(key=lambda c: c[0])
-        hours = self.player.duration() >= 3600 * 1000 or any(c[0] >= 3600 * 1000 for c in self.chapters)
+        hours = self.duration_ms() >= 3600 * 1000 or any(c[0] >= 3600 * 1000 for c in self.chapters)
         self.chap_list.clear()
         for ms, title in self.chapters:
             item = QListWidgetItem(f"{format_clock(ms, hours=hours)}  {title}")
@@ -911,7 +1009,7 @@ class VideoCaptureTab(QWidget):
         if not self.video_path:
             warn(self, "No Video", "Open a video first.")
             return
-        ms = self.player.position()
+        ms = self.rel(self.player.position())
         title = self.title_edit.text().strip() or f"Chapter {len(self.chapters) + 1}"
         self.chapters.append([ms, title])
         self.title_edit.clear()
@@ -921,8 +1019,9 @@ class VideoCaptureTab(QWidget):
     def goto_chapter(self):
         row = self._selected_chapter()
         if row is not None:
+            self._end_priming()
             self.player.pause()
-            self.player.setPosition(self.chapters[row][0])
+            self.snap_to_frame(self._start_ms + self.chapters[row][0])
 
     def rename_chapter(self):
         row = self._selected_chapter()
@@ -936,7 +1035,7 @@ class VideoCaptureTab(QWidget):
     def move_chapter_here(self):
         row = self._selected_chapter()
         if row is None: return
-        self.chapters[row][0] = self.player.position()
+        self.chapters[row][0] = self.rel(self.player.position())
         self.refresh_chapters(select_ms=self.chapters[row][0])
         self._save_chapters()
 
@@ -948,7 +1047,7 @@ class VideoCaptureTab(QWidget):
         self._save_chapters()
 
     def youtube_lines(self):
-        hours = self.player.duration() >= 3600 * 1000 or any(c[0] >= 3600 * 1000 for c in self.chapters)
+        hours = self.duration_ms() >= 3600 * 1000 or any(c[0] >= 3600 * 1000 for c in self.chapters)
         return [f"{format_clock(ms, hours=hours)} {title}" for ms, title in sorted(self.chapters)]
 
     def _check_youtube_rules(self):
@@ -1087,7 +1186,9 @@ class ScreenCaptureApp(QWidget):
         self.apply_capture_exclusion()
 
     def apply_capture_exclusion(self):
-        exclude_from_capture(self, self.hide_from_capture)
+        # Only hide the window while a capture is running, so screen sharing (Discord, Teams, OBS)
+        # can still see Auto-Scapture the rest of the time.
+        exclude_from_capture(self, self.hide_from_capture and self.is_listening)
 
     def _apply_tab_size_policies(self, index):
         """Only the visible tab counts toward the window's minimum size (so the narrow capture
@@ -1759,7 +1860,7 @@ class ScreenCaptureApp(QWidget):
             og.addWidget(box, row, col)
 
         pref_checkbox("Play a sound on each capture", "play_sound", 0, 0)
-        pref_checkbox("Hide Auto-Scapture from its own screenshots", "hide_from_capture", 0, 1, self.apply_capture_exclusion)
+        pref_checkbox("Hide Auto-Scapture from its own screenshots (while capturing)", "hide_from_capture", 0, 1, self.apply_capture_exclusion)
         pref_checkbox("Add page numbers to PDF", "pdf_page_numbers", 1, 0)
         size_row = QHBoxLayout()
         size_row.addWidget(QLabel("PDF page size:"))
@@ -2074,7 +2175,13 @@ class ScreenCaptureApp(QWidget):
     def _grab_without_self(self):
         """Grab the capture area, making sure this window isn't in the shot."""
         if self.hide_from_capture:
-            return grab_region(self.capture_region)
+            exclude_from_capture(self, True)
+            QApplication.processEvents()
+            time.sleep(0.1)  # let the compositor apply it
+            try:
+                return grab_region(self.capture_region)
+            finally:
+                self.apply_capture_exclusion()
         self.setWindowOpacity(0.0)
         QApplication.processEvents()
         time.sleep(0.2)
@@ -2193,6 +2300,7 @@ class ScreenCaptureApp(QWidget):
 
             self.is_listening = True
             self._run_flagged = 0
+            self.apply_capture_exclusion()
             self.toggle_ui_lock(lock=True)
 
             # Read widget values here on the GUI thread; worker threads must not touch widgets
@@ -2212,6 +2320,7 @@ class ScreenCaptureApp(QWidget):
                     error(self, "Error", "Invalid key combination.")
                     self.toggle_ui_lock(lock=False)
                     self.is_listening = False
+                    self.apply_capture_exclusion()
                     return
                 self.set_start_btn(f"Stop Listening ({custom_hotkey})", "red")
             else:
@@ -2230,6 +2339,7 @@ class ScreenCaptureApp(QWidget):
 
         else:
             self.is_listening = False
+            self.apply_capture_exclusion()
             self.toggle_ui_lock(lock=False)
             if getattr(self, "abort_hotkey", None) is not None:
                 try: keyboard.remove_hotkey(self.abort_hotkey)
