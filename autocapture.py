@@ -6,6 +6,7 @@ import time
 import random
 import re # Added for the smart renamer context peek
 import ctypes
+import math
 import io
 import struct
 import zlib
@@ -13,15 +14,22 @@ import zlib
 import keyboard
 from PIL import ImageGrab, Image, ImageChops, ImageStat, ImageDraw, ImageFont
 
-from PySide6.QtCore import Qt, QObject, QTimer, Signal, QRect, QPoint, QSize
+from PySide6.QtCore import Qt, QObject, QTimer, Signal, QRect, QPoint, QSize, QUrl
 from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QIcon, QKeySequence, QPainter, QPalette, QPen, QShortcut, QPixmap, QImage, QGuiApplication
 from PySide6.QtWidgets import (
     QApplication, QWidget, QDialog, QTabWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QCheckBox, QRadioButton, QButtonGroup, QLineEdit, QComboBox,
     QSpinBox, QDoubleSpinBox, QGroupBox, QListWidget, QListWidgetItem, QAbstractItemView, QFrame,
     QPlainTextEdit, QScrollArea, QStackedWidget, QMessageBox, QInputDialog,
-    QFileDialog, QColorDialog,
+    QFileDialog, QColorDialog, QSlider, QSplitter, QStyle, QSizePolicy,
 )
+
+try:  # Video Capture tab needs the QtMultimedia add-on (FFmpeg backend, hardware decoding where available)
+    from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QMediaMetaData
+    from PySide6.QtMultimediaWidgets import QVideoWidget
+    VIDEO_AVAILABLE = True
+except ImportError:
+    VIDEO_AVAILABLE = False
 
 APP_TITLE = "Auto-Scapture Test Build (1.6.2)"
 
@@ -552,6 +560,449 @@ class RedactionCanvas(QWidget):
 
 
 # ==========================================
+# --- VIDEO CAPTURE TAB ---
+# ==========================================
+VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".wmv", ".flv", ".mpg", ".mpeg", ".ts")
+
+
+def qimage_to_pil(qimg):
+    qimg = qimg.convertToFormat(QImage.Format_RGB888)
+    w, h, bpl = qimg.width(), qimg.height(), qimg.bytesPerLine()
+    return Image.frombuffer("RGB", (w, h), bytes(qimg.constBits()), "raw", "RGB", bpl, 1).copy()
+
+
+def format_clock(ms, with_ms=False, hours=False):
+    total_s, rem_ms = divmod(max(0, int(ms)), 1000)
+    h, rem = divmod(total_s, 3600)
+    m, sec = divmod(rem, 60)
+    text = f"{h}:{m:02d}:{sec:02d}" if (hours or h) else f"{m:02d}:{sec:02d}"
+    return text + (f".{rem_ms:03d}" if with_ms else "")
+
+
+class VideoCaptureTab(QWidget):
+    """Media player for grabbing native-resolution frames and building YouTube chapter timestamps."""
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.video_path = None
+        self.fps = 30.0
+        self.last_frame = None
+        self.chapters = []           # [[ms, title], ...]
+        self._priming = False
+        self._was_playing = False
+
+        self.player = QMediaPlayer(self)
+        self.audio = QAudioOutput(self)
+        self.player.setAudioOutput(self.audio)
+        self.video = QVideoWidget()
+        self.video.setStyleSheet("background: black;")
+        self.player.setVideoOutput(self.video)
+        self.video.videoSink().videoFrameChanged.connect(self._on_frame)
+
+        self.player.mediaStatusChanged.connect(self._on_status)
+        self.player.durationChanged.connect(self._on_duration)
+        self.player.positionChanged.connect(self._on_position)
+        self.player.playbackStateChanged.connect(self._on_state)
+        self.player.errorOccurred.connect(lambda _e, msg: msg and warn(self, "Video Error", msg))
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 8, 12, 10)
+
+        # --- top bar ---
+        top = QHBoxLayout()
+        self.open_btn = make_button("Open Video...", lambda: self.open_video(), bg=PRIMARY, fg="white", bold=True)
+        top.addWidget(self.open_btn)
+        self.file_lbl = QLabel("No video loaded")
+        f = self.file_lbl.font(); f.setBold(True); self.file_lbl.setFont(f)
+        top.addWidget(self.file_lbl, 1)
+        self.info_lbl = QLabel("")
+        self.info_lbl.setStyleSheet("color: #6b7280;")
+        top.addWidget(self.info_lbl)
+        root.addLayout(top)
+
+        splitter = QSplitter(Qt.Horizontal)
+        root.addWidget(splitter, 1)
+
+        # --- player column ---
+        player_col = QWidget()
+        pc = QVBoxLayout(player_col)
+        pc.setContentsMargins(0, 0, 0, 0)
+        self.stack = QStackedWidget()
+        placeholder = QLabel("Open a video (or drop one here) to scrub through it\nand capture frames at full resolution.")
+        placeholder.setAlignment(Qt.AlignCenter)
+        placeholder.setStyleSheet("background: #1f2937; color: #9ca3af; border-radius: 8px; font-size: 11pt;")
+        self.stack.addWidget(placeholder)
+        self.stack.addWidget(self.video)
+        self.stack.setMinimumSize(480, 270)
+        pc.addWidget(self.stack, 1)
+
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setEnabled(False)
+        self.slider.sliderPressed.connect(self._slider_pressed)
+        self.slider.sliderMoved.connect(self.player.setPosition)
+        self.slider.sliderReleased.connect(self._slider_released)
+        pc.addWidget(self.slider)
+
+        self.time_lbl = QLabel("00:00.000 / 00:00.000")
+        self.time_lbl.setFont(QFont("Consolas", 10))
+        pc.addWidget(self.time_lbl)
+
+        ctl = QHBoxLayout()
+        icon = self.style().standardIcon
+        def tool(ic, tip, slot):
+            b = QPushButton()
+            b.setIcon(icon(ic))
+            b.setToolTip(tip)
+            b.clicked.connect(slot)
+            b.setMinimumWidth(40)
+            ctl.addWidget(b)
+            return b
+        self.prev_frame_btn = tool(QStyle.SP_MediaSkipBackward, "Previous frame  (Left)", lambda: self.step_frame(-1))
+        self.back_btn = tool(QStyle.SP_MediaSeekBackward, "Back 5 seconds  (Shift+Left)", lambda: self.jump(-5000))
+        self.play_btn = tool(QStyle.SP_MediaPlay, "Play / Pause  (Space)", self.toggle_play)
+        self.fwd_btn = tool(QStyle.SP_MediaSeekForward, "Forward 5 seconds  (Shift+Right)", lambda: self.jump(5000))
+        self.next_frame_btn = tool(QStyle.SP_MediaSkipForward, "Next frame  (Right)", lambda: self.step_frame(1))
+
+        ctl.addSpacing(8)
+        ctl.addWidget(QLabel("Speed:"))
+        self.speed_combo = QComboBox()
+        self.speed_combo.addItems(["0.25x", "0.5x", "1x", "1.5x", "2x"])
+        self.speed_combo.setCurrentText("1x")
+        self.speed_combo.currentTextChanged.connect(lambda t: self.player.setPlaybackRate(float(t[:-1])))
+        ctl.addWidget(self.speed_combo)
+
+        self.mute_btn = QPushButton()
+        self.mute_btn.setIcon(icon(QStyle.SP_MediaVolume))
+        self.mute_btn.setToolTip("Mute / unmute")
+        self.mute_btn.clicked.connect(self.toggle_mute)
+        ctl.addWidget(self.mute_btn)
+        self.volume = QSlider(Qt.Horizontal)
+        self.volume.setRange(0, 100)
+        self.volume.setValue(80)
+        self.volume.setFixedWidth(90)
+        self.volume.valueChanged.connect(lambda v: self.audio.setVolume(v / 100))
+        self.audio.setVolume(0.8)
+        ctl.addWidget(self.volume)
+        ctl.addStretch()
+
+        self.capture_btn = make_button("Capture Frame  (C)", self.capture_frame, bg=PRIMARY, fg="white", bold=True, point_size=10)
+        self.capture_btn.setMinimumHeight(34)
+        self.capture_btn.setToolTip("Save the current frame at the video's native resolution into the current session")
+        ctl.addWidget(self.capture_btn)
+        pc.addLayout(ctl)
+
+        hint = QLabel("Frames are taken straight from the decoded video at native resolution, with no player controls in the shot. "
+                      "They join the current session (Review, PDF and Markdown work as usual).")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6b7280; font-size: 8pt;")
+        pc.addWidget(hint)
+        splitter.addWidget(player_col)
+
+        # --- chapters panel ---
+        chap_box = QGroupBox("YouTube Timestamps")
+        cb = QVBoxLayout(chap_box)
+        add_row = QHBoxLayout()
+        self.title_edit = QLineEdit()
+        self.title_edit.setPlaceholderText("Chapter title (e.g. Intro)")
+        self.title_edit.returnPressed.connect(self.add_chapter)
+        add_row.addWidget(self.title_edit, 1)
+        add_btn = make_button("Add  (M)", self.add_chapter, bg="#d9ead3")
+        add_btn.setToolTip("Add a timestamp at the current video position")
+        add_row.addWidget(add_btn)
+        cb.addLayout(add_row)
+
+        self.chap_list = QListWidget()
+        self.chap_list.setFont(QFont("Consolas", 10))
+        self.chap_list.itemDoubleClicked.connect(lambda _i: self.goto_chapter())
+        QShortcut(QKeySequence.Delete, self.chap_list, self.delete_chapter, context=Qt.WidgetShortcut)
+        cb.addWidget(self.chap_list, 1)
+
+        edit_grid = QGridLayout()
+        edit_grid.addWidget(make_button("Go To", self.goto_chapter), 0, 0)
+        edit_grid.addWidget(make_button("Rename", self.rename_chapter), 0, 1)
+        move_btn = make_button("Move Here", self.move_chapter_here)
+        move_btn.setToolTip("Move the selected timestamp to the current video position")
+        edit_grid.addWidget(move_btn, 1, 0)
+        edit_grid.addWidget(make_button("Delete", self.delete_chapter, fg="red"), 1, 1)
+        cb.addLayout(edit_grid)
+
+        exp_row = QHBoxLayout()
+        exp_btn = make_button("Export YouTube .txt", self.export_chapters, bg="#d9ead3", bold=True)
+        exp_row.addWidget(exp_btn, 1)
+        exp_row.addWidget(make_button("Copy", self.copy_chapters))
+        cb.addLayout(exp_row)
+
+        rules = QLabel("YouTube chapters need the first timestamp at 0:00, at least 3 timestamps, and at least 10 seconds between them.")
+        rules.setWordWrap(True)
+        rules.setStyleSheet("color: #6b7280; font-size: 8pt;")
+        cb.addWidget(rules)
+        chap_box.setMinimumWidth(260)
+        splitter.addWidget(chap_box)
+        splitter.setStretchFactor(0, 1)
+        splitter.setSizes([760, 300])
+
+        # --- keyboard shortcuts (text fields keep their own typing keys) ---
+        for keys, slot in [("Space", self.toggle_play), ("Right", lambda: self.step_frame(1)), ("Left", lambda: self.step_frame(-1)),
+                           ("Shift+Right", lambda: self.jump(5000)), ("Shift+Left", lambda: self.jump(-5000)),
+                           ("C", self.capture_frame), ("M", self.add_chapter)]:
+            QShortcut(QKeySequence(keys), self, slot, context=Qt.WidgetWithChildrenShortcut)
+
+        self._set_controls_enabled(False)
+
+    # ---------------- loading ----------------
+    def _set_controls_enabled(self, on):
+        for w in (self.prev_frame_btn, self.back_btn, self.play_btn, self.fwd_btn, self.next_frame_btn,
+                  self.capture_btn, self.slider, self.speed_combo):
+            w.setEnabled(on)
+
+    def open_video(self, path=None):
+        if not path:
+            start = os.path.dirname(self.video_path) if self.video_path else os.path.expanduser("~")
+            path, _ = QFileDialog.getOpenFileName(self, "Open Video", start,
+                                                  "Videos (" + " ".join("*" + e for e in VIDEO_EXTS) + ");;All Files (*.*)")
+            if not path: return
+        path = os.path.normpath(path)
+        self.player.stop()
+        self.video_path = path
+        self.last_frame = None
+        self.file_lbl.setText(os.path.basename(path))
+        self.file_lbl.setToolTip(path)
+        self.info_lbl.setText("Loading...")
+        self.chapters = [list(c) for c in self.app.video_chapters.get(path, [])]
+        self.refresh_chapters()
+        self.stack.setCurrentWidget(self.video)
+        self.player.setSource(QUrl.fromLocalFile(path))
+
+    def _on_status(self, status):
+        if status == QMediaPlayer.LoadedMedia and self.video_path:
+            md = self.player.metaData()
+            fps = md.value(QMediaMetaData.VideoFrameRate)
+            self.fps = float(fps) if fps and float(fps) > 0 else 30.0
+            res = md.value(QMediaMetaData.Resolution)
+            res_txt = f"{res.width()} x {res.height()}" if res and res.width() > 0 else "unknown size"
+            self.info_lbl.setText(f"{res_txt}  •  {self.fps:g} fps  •  {format_clock(self.player.duration())}")
+            self._set_controls_enabled(True)
+            # Decode the first frame so there is something to see / capture before pressing Play
+            self._priming = True
+            self._muted_before = self.audio.isMuted()
+            self.audio.setMuted(True)
+            self.player.play()
+        elif status == QMediaPlayer.InvalidMedia:
+            self.info_lbl.setText("Could not open this file")
+            self._set_controls_enabled(False)
+
+    def _on_frame(self, frame):
+        if not frame.isValid():
+            return
+        self.last_frame = frame
+        if self._priming:
+            self._priming = False
+            # Pausing from inside the player's own frame callback can leave its clock running,
+            # so finish priming once control is back in the event loop.
+            # Also give the decoder a moment to fully start, otherwise the pause may not stick.
+            QTimer.singleShot(200, self._finish_priming)
+
+    def _finish_priming(self, attempt=0):
+        self.player.pause()
+        self.player.setPosition(0)
+        # Safety check: a paused player's position must not keep moving
+        def verify():
+            if self.player.playbackState() != QMediaPlayer.PlayingState and self.player.position() > 150 and attempt < 3:
+                self.player.play()
+                QTimer.singleShot(150, lambda: self._finish_priming(attempt + 1))
+            else:
+                self.audio.setMuted(self._muted_before)
+        QTimer.singleShot(400, verify)
+
+    def _on_duration(self, duration):
+        self.slider.setRange(0, max(0, duration))
+        self._update_time_label(self.player.position())
+
+    def _on_position(self, pos):
+        if not self.slider.isSliderDown():
+            self.slider.setValue(pos)
+        self._update_time_label(pos)
+
+    def _update_time_label(self, pos):
+        frame_no = self.current_frame_index(pos) + 1
+        self.time_lbl.setText(f"{format_clock(pos, True)} / {format_clock(self.player.duration(), True)}    Frame {frame_no}")
+
+    def _on_state(self, state):
+        playing = state == QMediaPlayer.PlayingState and not self._priming
+        self.play_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaPause if playing else QStyle.SP_MediaPlay))
+
+    # ---------------- transport ----------------
+    def current_frame_index(self, pos=None):
+        pos = self.player.position() if pos is None else pos
+        return math.floor(pos * self.fps / 1000.0 + 1e-6)
+
+    def toggle_play(self):
+        if not self.video_path: return
+        if self.player.playbackState() == QMediaPlayer.PlayingState:
+            self.player.pause()
+        else:
+            if self.player.position() >= self.player.duration() - 50:
+                self.player.setPosition(0)
+            self.player.play()
+
+    def step_frame(self, direction):
+        if not self.video_path: return
+        self.player.pause()
+        last_index = max(0, math.ceil(self.player.duration() * self.fps / 1000.0) - 1)
+        idx = min(max(0, self.current_frame_index() + direction), last_index)
+        # Aim for the middle of the target frame so rounding can never land on a neighbour
+        self.player.setPosition(int(round((idx + 0.5) * 1000.0 / self.fps)))
+
+    def jump(self, delta_ms):
+        if not self.video_path: return
+        self.player.setPosition(min(max(0, self.player.position() + delta_ms), self.player.duration()))
+
+    def toggle_mute(self):
+        self.audio.setMuted(not self.audio.isMuted())
+        self.mute_btn.setIcon(self.style().standardIcon(QStyle.SP_MediaVolumeMuted if self.audio.isMuted() else QStyle.SP_MediaVolume))
+
+    def _slider_pressed(self):
+        self._was_playing = self.player.playbackState() == QMediaPlayer.PlayingState
+        self.player.pause()
+
+    def _slider_released(self):
+        self.player.setPosition(self.slider.value())
+        if self._was_playing:
+            self.player.play()
+
+    # ---------------- capture ----------------
+    def capture_frame(self):
+        if not self.video_path or self.last_frame is None:
+            warn(self, "No Frame", "Open a video first.")
+            return
+        img = self.last_frame.toImage()
+        if img.isNull():
+            warn(self, "No Frame", "Couldn't read the current frame. Try stepping one frame and capture again.")
+            return
+        self.app.save_raw_image(qimage_to_pil(img))
+
+    # ---------------- chapters ----------------
+    def _save_chapters(self):
+        if not self.video_path: return
+        if self.chapters:
+            self.app.video_chapters[self.video_path] = self.chapters
+        else:
+            self.app.video_chapters.pop(self.video_path, None)
+        self.app.save_settings()
+
+    def refresh_chapters(self, select_ms=None):
+        self.chapters.sort(key=lambda c: c[0])
+        hours = self.player.duration() >= 3600 * 1000 or any(c[0] >= 3600 * 1000 for c in self.chapters)
+        self.chap_list.clear()
+        for ms, title in self.chapters:
+            item = QListWidgetItem(f"{format_clock(ms, hours=hours)}  {title}")
+            item.setData(Qt.UserRole, ms)
+            item.setToolTip(f"{format_clock(ms, with_ms=True, hours=hours)}  -  double-click to jump here")
+            self.chap_list.addItem(item)
+            if ms == select_ms:
+                self.chap_list.setCurrentItem(item)
+
+    def _selected_chapter(self):
+        row = self.chap_list.currentRow()
+        return row if 0 <= row < len(self.chapters) else None
+
+    def add_chapter(self):
+        if not self.video_path:
+            warn(self, "No Video", "Open a video first.")
+            return
+        ms = self.player.position()
+        title = self.title_edit.text().strip() or f"Chapter {len(self.chapters) + 1}"
+        self.chapters.append([ms, title])
+        self.title_edit.clear()
+        self.refresh_chapters(select_ms=ms)
+        self._save_chapters()
+
+    def goto_chapter(self):
+        row = self._selected_chapter()
+        if row is not None:
+            self.player.pause()
+            self.player.setPosition(self.chapters[row][0])
+
+    def rename_chapter(self):
+        row = self._selected_chapter()
+        if row is None: return
+        text, ok = QInputDialog.getText(self, "Rename Timestamp", "Title:", text=self.chapters[row][1])
+        if ok and text.strip():
+            self.chapters[row][1] = text.strip()
+            self.refresh_chapters(select_ms=self.chapters[row][0])
+            self._save_chapters()
+
+    def move_chapter_here(self):
+        row = self._selected_chapter()
+        if row is None: return
+        self.chapters[row][0] = self.player.position()
+        self.refresh_chapters(select_ms=self.chapters[row][0])
+        self._save_chapters()
+
+    def delete_chapter(self):
+        row = self._selected_chapter()
+        if row is None: return
+        del self.chapters[row]
+        self.refresh_chapters()
+        self._save_chapters()
+
+    def youtube_lines(self):
+        hours = self.player.duration() >= 3600 * 1000 or any(c[0] >= 3600 * 1000 for c in self.chapters)
+        return [f"{format_clock(ms, hours=hours)} {title}" for ms, title in sorted(self.chapters)]
+
+    def _check_youtube_rules(self):
+        """Offer to fix / confirm YouTube's chapter rules. Returns False if the user cancelled."""
+        if not self.chapters:
+            info(self, "No Timestamps", "Add some timestamps first.")
+            return False
+        self.chapters.sort(key=lambda c: c[0])
+        if self.chapters[0][0] >= 1000:
+            if ask_yes_no(self, "First Timestamp", "YouTube requires the first timestamp to be 0:00.\n\nAdd an 'Intro' timestamp at 0:00?"):
+                self.chapters.insert(0, [0, "Intro"])
+                self.refresh_chapters()
+                self._save_chapters()
+        else:
+            self.chapters[0][0] = 0  # anything under one second counts as the start
+        problems = []
+        if self.chapters[0][0] != 0:
+            problems.append("The first timestamp isn't 0:00.")
+        if len(self.chapters) < 3:
+            problems.append(f"Only {len(self.chapters)} timestamp(s); YouTube needs at least 3.")
+        for (a_ms, a_t), (b_ms, b_t) in zip(self.chapters, self.chapters[1:]):
+            if b_ms - a_ms < 10000:
+                problems.append(f"'{a_t}' is shorter than 10 seconds.")
+        if problems:
+            return ask_yes_no(self, "YouTube Chapter Rules",
+                              "YouTube may not show these as chapters:\n\n- " + "\n- ".join(problems[:8]) + "\n\nContinue anyway?")
+        return True
+
+    def export_chapters(self):
+        if not self._check_youtube_rules(): return
+        base = os.path.splitext(os.path.basename(self.video_path))[0] if self.video_path else "Video"
+        start = os.path.join(os.path.dirname(self.video_path) if self.video_path else os.path.expanduser("~"),
+                             f"{base} - YouTube Timestamps.txt")
+        path, _ = QFileDialog.getSaveFileName(self, "Save YouTube Timestamps", start, "Text File (*.txt)")
+        if not path: return
+        text = "\n".join(self.youtube_lines()) + "\n"
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        except OSError as e:
+            error(self, "Error", f"Could not save the file:\n{e}")
+            return
+        info(self, "Timestamps Exported", f"Saved to:\n{path}\n\nPaste this into your YouTube description:\n\n{text}")
+
+    def copy_chapters(self):
+        if not self._check_youtube_rules(): return
+        QApplication.clipboard().setText("\n".join(self.youtube_lines()))
+        info(self, "Copied", "Timestamps copied - paste them into your YouTube description.")
+
+    def shutdown(self):
+        self.player.stop()
+
+
+# ==========================================
 # --- MAIN APPLICATION ---
 # ==========================================
 class ScreenCaptureApp(QWidget):
@@ -596,6 +1047,7 @@ class ScreenCaptureApp(QWidget):
         self.saved_filenames = prefs.get("saved_filenames", ["Module1_"])
 
         self.renamer_extensions = prefs.get("renamer_extensions", [".txt", ".cfg", ".csv", ".json", ".md", ".log"])
+        self.video_chapters = self.settings_data.get("video_chapters", {})
 
         # ==========================================
         # --- TABBED INTERFACE ---
@@ -614,6 +1066,15 @@ class ScreenCaptureApp(QWidget):
         self.setup_capture_ui()
         self.setup_renamer_ui()
 
+        self.video_tab = None
+        if VIDEO_AVAILABLE:
+            self.video_tab = VideoCaptureTab(self)
+            self.notebook.addTab(self.video_tab, "Video Capture")
+        self._tab_sizes = {}
+        self._current_tab = 0
+        self._apply_tab_size_policies(0)
+        self.notebook.currentChanged.connect(self._on_tab_changed)
+
         self.setAcceptDrops(True)
         self.resize(520, self.sizeHint().height())
 
@@ -627,6 +1088,30 @@ class ScreenCaptureApp(QWidget):
 
     def apply_capture_exclusion(self):
         exclude_from_capture(self, self.hide_from_capture)
+
+    def _apply_tab_size_policies(self, index):
+        """Only the visible tab counts toward the window's minimum size (so the narrow capture
+        tab isn't forced to be as wide as the video player)."""
+        for i in range(self.notebook.count()):
+            policy = QSizePolicy.Preferred if i == index else QSizePolicy.Ignored
+            self.notebook.widget(i).setSizePolicy(policy, policy)
+        self.notebook.updateGeometry()
+
+    def _on_tab_changed(self, index):
+        # Each tab remembers its own window size; the video tab opens roomy by default
+        self._tab_sizes[self._current_tab] = self.size()
+        self._current_tab = index
+        self._apply_tab_size_policies(index)
+        if index in self._tab_sizes:
+            target = self._tab_sizes[index]
+        elif self.notebook.widget(index) is self.video_tab:
+            avail = self.screen().availableGeometry()
+            target = QSize(min(1180, avail.width() - 40), min(760, avail.height() - 60))
+        else:
+            return
+        # Let the layout drop the previous tab's minimum size before resizing
+        self.layout().activate()
+        QTimer.singleShot(0, lambda: self.resize(target))
 
     def ui_call(self, fn):
         """Thread-safe: schedule fn on the GUI thread."""
@@ -1393,6 +1878,7 @@ class ScreenCaptureApp(QWidget):
     def save_settings(self):
         data = {
             "presets": self.presets,
+            "video_chapters": self.video_chapters,
             "preferences": {
                 "auto_open_pdf": self.auto_open_pdf,
                 "continuous_capture": self.cont_cb.isChecked(),
@@ -1621,7 +2107,13 @@ class ScreenCaptureApp(QWidget):
     def dropEvent(self, event):
         paths = [os.path.normpath(u.toLocalFile()) for u in event.mimeData().urls() if u.isLocalFile()]
         paths = [p for p in paths if os.path.isfile(p)]
-        if self.notebook.currentIndex() == 1:
+        if self.video_tab is not None and self.notebook.currentWidget() is self.video_tab:
+            videos = [p for p in paths if p.lower().endswith(VIDEO_EXTS)]
+            if videos:
+                self.video_tab.open_video(videos[0])
+            else:
+                info(self, "Not a Video", "Drop a video file (MP4, MKV, MOV, AVI, WEBM...) to open it.")
+        elif self.notebook.currentIndex() == 1:
             added = [p for p in paths if p not in self.rename_files_list]
             self.rename_files_list.extend(added)
             self.refresh_renamer_main_list()
@@ -1654,7 +2146,8 @@ class ScreenCaptureApp(QWidget):
         self.select_btn.setEnabled(enabled)
         self.load_btn.setEnabled(enabled)
 
-        self.notebook.setTabEnabled(1, enabled)
+        for i in range(1, self.notebook.count()):
+            self.notebook.setTabEnabled(i, enabled)
 
         mode = self.capture_mode()
         if mode == "Manual":
@@ -2547,6 +3040,8 @@ class ScreenCaptureApp(QWidget):
         info(self, "Markdown Exported", f"Saved {len(self.session_images)} steps to:\n{md_path}\n\nThe session is kept, so you can still export a PDF.")
 
     def closeEvent(self, event):
+        if self.video_tab is not None:
+            self.video_tab.shutdown()
         self.save_settings()
         self.is_listening = False
         try: keyboard.unhook_all()

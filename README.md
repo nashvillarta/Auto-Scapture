@@ -37,7 +37,15 @@ The core architecture of the application includes the following:
 * **Drag & Drop:** Drop images onto the window to add them to the session, or files onto the Lab Renamer tab.
 * **Area Presets:** Save and recall specific bounding box coordinates on your screen.
 
-## III. Lab Renamer
+## III. Video Capture
+A built-in media player tab for pulling documentation screenshots out of recordings:
+* **Scrub & Step:** Play/pause, seek bar, +/- 5 s jumps, playback speed, and exact frame-by-frame stepping (Left/Right arrows). Uses Qt's FFmpeg backend with hardware video decoding where your device supports it.
+* **Native-Resolution Frame Capture:** "Capture Frame" (C) saves the decoded video frame itself at the video's native resolution, with no player controls or screen scaling in the shot. Frames join the current session, so Review, duplicate flags, PDF and Markdown export all work as usual.
+* **YouTube Timestamps:** Add titled timestamps (M) at the current position, jump to / rename / move / delete them, and export a ready-to-paste YouTube chapters `.txt` (or copy it). YouTube's rules (first stamp at 0:00, at least 3 stamps, 10 s minimum) are checked for you, and timestamps are remembered per video.
+
+Keyboard: Space = play/pause, Left/Right = previous/next frame, Shift+Left/Right = -/+ 5 s, C = capture frame, M = add timestamp.
+
+## IV. Lab Renamer
 To expand the functionality for lab environments, a secondary module was implemented:
 * **Bulk Sequential Renamer:** Load `.txt`, `.cfg`, or `.csv` files, preview their contents, and rename them sequentially in bulk.
 * **Context Naming:** Tick "Context Naming" and the app peeks inside files to find "Title" or "Experiment" headers and renames the file accordingly.
@@ -45,6 +53,6 @@ To expand the functionality for lab environments, a secondary module was impleme
 * **Format Conversion:** Manually edit or automatically batch-convert file extensions.
 * **File Merger:** Combine multiple text or config files into one large master document, complete with generated visual dividers.
 
-## IV. Notes & Reflection
+## V. Notes & Reflection
 * The application is built entirely in Python using `PySide6` (Qt) for the GUI (migrated from `Tkinter`), `keyboard` for global hotkeys, and `Pillow` for image processing.
 * The program compiles with PyInstaller (`build_exe.ps1`) into a single standalone `.exe` for daily use.
