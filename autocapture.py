@@ -6,6 +6,11 @@ import time
 import random
 import re # Added for the smart renamer context peek
 import ctypes
+import ctypes.wintypes as wt
+import shutil
+import uuid
+import datetime
+from collections import OrderedDict
 import array
 import math
 import io
@@ -15,14 +20,15 @@ import zlib
 import keyboard
 from PIL import ImageGrab, Image, ImageChops, ImageStat, ImageDraw, ImageFont
 
-from PySide6.QtCore import Qt, QObject, QTimer, Signal, QRect, QPoint, QSize, QUrl, QByteArray
-from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QIcon, QKeySequence, QPainter, QPalette, QPen, QShortcut, QPixmap, QImage, QGuiApplication
+from PySide6.QtCore import Qt, QObject, QTimer, Signal, QRect, QRectF, QPoint, QSize, QUrl, QByteArray, QRunnable, QThreadPool, QFileSystemWatcher
+from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics, QIcon, QKeySequence, QPainter, QPalette, QPen, QShortcut, QPixmap, QImage, QGuiApplication, QImageReader, QRegion, QAction
 from PySide6.QtWidgets import (
     QApplication, QWidget, QDialog, QTabWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QCheckBox, QRadioButton, QButtonGroup, QLineEdit, QComboBox,
     QSpinBox, QDoubleSpinBox, QGroupBox, QListWidget, QListWidgetItem, QAbstractItemView, QFrame,
     QPlainTextEdit, QScrollArea, QStackedWidget, QMessageBox, QInputDialog,
     QFileDialog, QColorDialog, QSlider, QSplitter, QStyle, QSizePolicy, QStyleOptionSlider, QLayout,
+    QListView, QSystemTrayIcon, QMenu,
 )
 
 # Qt's FFmpeg engine opens MOV/MP4/MKV/WEBM/AVI alike and seeks accurately; the Windows Media
@@ -1289,6 +1295,966 @@ class VideoCaptureTab(QWidget):
 
 
 # ==========================================
+# --- SCREENSHOTS (replacement for Win+Shift+S / Snipping Tool) ---
+# ==========================================
+GALLERY_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")
+
+
+def windows_screenshots_folder():
+    """The folder Windows' own screenshot tools save to (follows OneDrive / moved folders)."""
+    try:
+        class GUID(ctypes.Structure):
+            _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16), ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_ubyte * 8)]
+        u = uuid.UUID("b7bede81-df94-4682-a7d8-57a52620b86f")  # FOLDERID_Screenshots
+        guid = GUID(u.time_low, u.time_mid, u.time_hi_version, (ctypes.c_ubyte * 8)(*u.bytes[8:]))
+        path = ctypes.c_wchar_p()
+        if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None, ctypes.byref(path)) == 0 and path.value:
+            result = path.value
+            ctypes.windll.ole32.CoTaskMemFree(path)
+            return result
+    except Exception:
+        pass
+    return os.path.join(os.path.expanduser("~"), "Pictures", "Screenshots")
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wt.DWORD), ("rcMonitor", wt.RECT), ("rcWork", wt.RECT), ("dwFlags", wt.DWORD)]
+
+
+def monitor_rect_at(point):
+    """Physical-pixel rectangle of the monitor containing point."""
+    user32 = ctypes.windll.user32
+    handle = user32.MonitorFromPoint(wt.POINT(*point), 2)  # MONITOR_DEFAULTTONEAREST
+    info = _MONITORINFO()
+    info.cbSize = ctypes.sizeof(info)
+    user32.GetMonitorInfoW(handle, ctypes.byref(info))
+    r = info.rcMonitor
+    return (r.left, r.top, r.right, r.bottom)
+
+
+def virtual_screen_rect():
+    m = ctypes.windll.user32.GetSystemMetrics
+    x, y = m(76), m(77)
+    return (x, y, x + m(78), y + m(79))
+
+
+def list_windows_physical():
+    """Visible, titled top-level windows (top of the z-order first) as physical-pixel rectangles."""
+    user32, dwm = ctypes.windll.user32, ctypes.windll.dwmapi
+    own_pid = os.getpid()
+    rects = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
+    def callback(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd) or user32.GetWindowTextLengthW(hwnd) == 0:
+            return True
+        pid = wt.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value == own_pid:
+            return True
+        cloaked = ctypes.c_int(0)
+        dwm.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), 4)  # DWMWA_CLOAKED (hidden UWP windows)
+        if cloaked.value:
+            return True
+        cls = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(hwnd, cls, 64)
+        if cls.value in ("Progman", "WorkerW"):
+            return True
+        r = wt.RECT()
+        # the visible frame, without the invisible resize borders
+        if dwm.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(r), ctypes.sizeof(r)) != 0:
+            user32.GetWindowRect(hwnd, ctypes.byref(r))
+        if r.right - r.left > 20 and r.bottom - r.top > 20:
+            rects.append((r.left, r.top, r.right, r.bottom))
+        return True
+
+    user32.EnumWindows(callback, 0)
+    return rects
+
+
+def send_to_recycle_bin(paths):
+    """Delete files to the Recycle Bin (undoable). Windows warns if a file can't be recycled."""
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [("hwnd", wt.HWND), ("wFunc", wt.UINT), ("pFrom", ctypes.c_void_p), ("pTo", ctypes.c_void_p),
+                    ("fFlags", ctypes.c_uint16), ("fAnyOperationsAborted", wt.BOOL),
+                    ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wt.LPCWSTR)]
+    FO_DELETE, FOF_SILENT, FOF_NOCONFIRMATION, FOF_ALLOWUNDO, FOF_WANTNUKEWARNING = 3, 0x4, 0x10, 0x40, 0x4000
+    names = "\0".join(os.path.abspath(p) for p in paths) + "\0\0"
+    buf = ctypes.create_unicode_buffer(names, len(names) + 1)
+    op = SHFILEOPSTRUCTW()
+    op.wFunc = FO_DELETE
+    op.pFrom = ctypes.cast(buf, ctypes.c_void_p)
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_WANTNUKEWARNING
+    result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+    return result == 0 and not op.fAnyOperationsAborted
+
+
+def unique_path(folder, filename):
+    base, ext = os.path.splitext(filename)
+    candidate, n = os.path.join(folder, filename), 2
+    while os.path.exists(candidate):
+        candidate = os.path.join(folder, f"{base} ({n}){ext}")
+        n += 1
+    return candidate
+
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def autostart_enabled():
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            winreg.QueryValueEx(key, "Auto-Scapture")
+            return True
+    except OSError:
+        return False
+
+
+def set_autostart(enabled):
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+        if enabled:
+            winreg.SetValueEx(key, "Auto-Scapture", 0, winreg.REG_SZ, f'"{sys.executable}" --tray')
+        else:
+            try:
+                winreg.DeleteValue(key, "Auto-Scapture")
+            except FileNotFoundError:
+                pass
+
+
+class ScreenshotSession(QObject):
+    """Snipping-Tool style capture: freezes the screen, then drag for an area or click a window."""
+    captured = Signal(object)  # PIL image
+    cancelled = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.overlays = []
+        self.start_phys = None
+        self.cur_phys = None
+        self.hover = None
+        self._esc_hotkey = None
+
+    def start(self):
+        vx, vy, vx2, vy2 = virtual_screen_rect()
+        self.origin = (vx, vy)
+        self.frozen = ImageGrab.grab(all_screens=True)
+        self.windows = list_windows_physical()
+        self.overlays = [ScreenshotOverlay(self, scr) for scr in QGuiApplication.screens()]
+        for o in self.overlays:
+            o.show()
+        self.update_hover()
+        under = next((o for o in self.overlays if o.geometry().contains(QCursor.pos())), self.overlays[0])
+        under.activateWindow()
+        under.setFocus()
+        try:  # Esc works even if Windows didn't give the overlay keyboard focus
+            self._esc_hotkey = keyboard.add_hotkey("esc", lambda: QTimer.singleShot(0, self.cancel))
+        except Exception:
+            self._esc_hotkey = None
+
+    # --- state used by the overlays ---
+    def selection(self):
+        if self.start_phys and self.cur_phys:
+            (sx, sy), (cx, cy) = self.start_phys, self.cur_phys
+            return (min(sx, cx), min(sy, cy), max(sx, cx), max(sy, cy))
+        return None
+
+    def update_hover(self):
+        pt = cursor_pos_physical()
+        self.hover = next((r for r in self.windows if r[0] <= pt[0] < r[2] and r[1] <= pt[1] < r[3]), None) or monitor_rect_at(pt)
+        self.repaint_all()
+
+    def repaint_all(self):
+        for o in self.overlays:
+            o.update()
+
+    # --- input ---
+    def press(self):
+        self.start_phys = self.cur_phys = cursor_pos_physical()
+        self.repaint_all()
+
+    def move(self):
+        if self.start_phys:
+            self.cur_phys = cursor_pos_physical()
+            self.repaint_all()
+        else:
+            self.update_hover()
+
+    def release(self):
+        sel = self.selection()
+        if sel and sel[2] - sel[0] >= 5 and sel[3] - sel[1] >= 5:
+            self.finish(sel)          # dragged an area
+        else:
+            self.finish(self.hover)   # simple click: the window (or screen) under the cursor
+
+    def capture_screen(self):
+        self.finish(monitor_rect_at(cursor_pos_physical()))
+
+    def capture_all(self):
+        self.finish((self.origin[0], self.origin[1], self.origin[0] + self.frozen.width, self.origin[1] + self.frozen.height))
+
+    def _close(self):
+        if self._esc_hotkey is not None:
+            try: keyboard.remove_hotkey(self._esc_hotkey)
+            except (KeyError, ValueError): pass
+            self._esc_hotkey = None
+        for o in self.overlays:
+            o.close()
+        self.overlays = []
+
+    def cancel(self):
+        if not self.overlays: return
+        self._close()
+        self.cancelled.emit()
+
+    def finish(self, rect):
+        if not self.overlays: return
+        self._close()
+        ox, oy = self.origin
+        x1, y1 = max(0, rect[0] - ox), max(0, rect[1] - oy)
+        x2, y2 = min(self.frozen.width, rect[2] - ox), min(self.frozen.height, rect[3] - oy)
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            self.cancelled.emit()
+            return
+        self.captured.emit(self.frozen.crop((x1, y1, x2, y2)))
+
+
+class ScreenshotOverlay(QWidget):
+    """One frozen, dimmed monitor. Undimmed: the dragged area or the window under the cursor."""
+
+    def __init__(self, session, screen):
+        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.session = session
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CrossCursor)
+        self.g = screen.geometry()
+        self.dpr = screen.devicePixelRatio()
+        self.setGeometry(self.g)
+        ox, oy = session.origin
+        px1, py1 = self.g.x() - ox, self.g.y() - oy
+        crop = session.frozen.crop((px1, py1, px1 + round(self.g.width() * self.dpr), py1 + round(self.g.height() * self.dpr)))
+        self.background = pil_to_pixmap(crop)
+
+    def to_local(self, rect):
+        x1, y1, x2, y2 = rect
+        return QRectF((x1 - self.g.x()) / self.dpr, (y1 - self.g.y()) / self.dpr, (x2 - x1) / self.dpr, (y2 - y1) / self.dpr)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.drawPixmap(self.rect(), self.background)
+        sel = self.session.selection()
+        target = sel if sel else self.session.hover
+        dim = QColor(0, 0, 0, 115)
+        if target:
+            local = self.to_local(target)
+            p.setClipRegion(QRegion(self.rect()).subtracted(QRegion(local.toAlignedRect())))
+            p.fillRect(self.rect(), dim)
+            p.setClipping(False)
+            pen = QPen(QColor("#1f6feb"), 2)
+            if not sel:
+                pen.setStyle(Qt.DashLine)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(local.adjusted(1, 1, -1, -1))
+            label = f"{target[2] - target[0]} × {target[3] - target[1]}"
+            f = QFont("Segoe UI", 9); f.setBold(True)
+            p.setFont(f)
+            tw = QFontMetrics(f).horizontalAdvance(label) + 14
+            box = QRectF(local.left(), max(0, local.top() - 24), tw, 20)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(17, 24, 39, 220))
+            p.drawRoundedRect(box, 4, 4)
+            p.setPen(QColor("white"))
+            p.drawText(box, Qt.AlignCenter, label)
+        else:
+            p.fillRect(self.rect(), dim)
+        # hint
+        hint = "Drag to snip an area   •   Click a window to capture it   •   F: this screen   •   A: all screens   •   Esc: cancel"
+        f = QFont("Segoe UI", 10)
+        p.setFont(f)
+        tw = QFontMetrics(f).horizontalAdvance(hint) + 28
+        box = QRectF((self.width() - tw) / 2, 16, tw, 30)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(17, 24, 39, 230))
+        p.drawRoundedRect(box, 15, 15)
+        p.setPen(QColor("#e5e7eb"))
+        p.drawText(box, Qt.AlignCenter, hint)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.session.press()
+        elif event.button() == Qt.RightButton:
+            self.session.cancel()
+
+    def mouseMoveEvent(self, event):
+        self.session.move()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.session.release()
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key == Qt.Key_Escape:
+            self.session.cancel()
+        elif key == Qt.Key_F:
+            self.session.capture_screen()
+        elif key == Qt.Key_A:
+            self.session.capture_all()
+
+
+class _ThumbSignals(QObject):
+    done = Signal(int, str, QImage)
+
+
+class _ThumbJob(QRunnable):
+    def __init__(self, generation, path, size, signals):
+        super().__init__()
+        self.generation, self.path, self.size, self.signals = generation, path, size, signals
+
+    def run(self):
+        reader = QImageReader(self.path)
+        reader.setAutoTransform(True)
+        full = reader.size()
+        if full.isValid():
+            reader.setScaledSize(full.scaled(self.size, Qt.KeepAspectRatio))
+        image = reader.read()
+        self.signals.done.emit(self.generation, self.path, image)
+
+
+class ScreenshotsTab(QWidget):
+    """Take screenshots (Snipping-Tool replacement) and manage the Screenshots folder."""
+    THUMB = QSize(176, 104)
+    CACHE_LIMIT = 700
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.prefs = app.shot_prefs
+        self.folder = self.prefs.get("folder") or windows_screenshots_folder()
+        self.entries = []        # [(path, mtime, size)]
+        self.items = {}          # path -> QListWidgetItem
+        self.thumbs = OrderedDict()
+        self.pending = set()
+        self.generation = 0
+        self.session = None
+        self._busy = False
+        self._hotkey_handle = None
+        self.pool = QThreadPool(self)
+        self.pool.setMaxThreadCount(3)
+        self.thumb_signals = _ThumbSignals()
+        self.thumb_signals.done.connect(self._on_thumb)
+        self.placeholder = QPixmap(self.THUMB)
+        self.placeholder.fill(QColor("#e5e7eb"))
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 8, 12, 10)
+
+        # --- take a screenshot ---
+        take_box = QGroupBox("Take a Screenshot")
+        tb = QVBoxLayout(take_box)
+        row = QHBoxLayout()
+        self.snip_btn = make_button("Snip  (area or window)", lambda: self.take("snip"), bg=PRIMARY, fg="white", bold=True, point_size=10)
+        self.snip_btn.setMinimumHeight(34)
+        self.snip_btn.setToolTip("Freeze the screen, then drag an area or click a window")
+        row.addWidget(self.snip_btn)
+        self.screen_btn = make_button("Full Screen", lambda: self.take("screen"))
+        self.screen_btn.setToolTip("The monitor your mouse is on")
+        row.addWidget(self.screen_btn)
+        self.all_btn = make_button("All Monitors", lambda: self.take("all"))
+        row.addWidget(self.all_btn)
+        row.addSpacing(10)
+        row.addWidget(QLabel("Delay:"))
+        self.delay_combo = QComboBox()
+        self.delay_combo.addItems(["None", "3 seconds", "5 seconds", "10 seconds"])
+        self.delay_combo.setCurrentText(self.prefs.get("delay", "None"))
+        self.delay_combo.currentTextChanged.connect(lambda t: self._set_pref("delay", t))
+        row.addWidget(self.delay_combo)
+        self.clip_cb = QCheckBox("Copy to clipboard")
+        self.clip_cb.setChecked(self.prefs.get("copy_to_clipboard", True))
+        self.clip_cb.toggled.connect(lambda v: self._set_pref("copy_to_clipboard", v))
+        row.addWidget(self.clip_cb)
+        row.addStretch()
+        tb.addLayout(row)
+
+        row2 = QHBoxLayout()
+        self.hotkey_cb = QCheckBox("Screenshot key:")
+        self.hotkey_cb.setToolTip("Press this key anywhere to snip (while Auto-Scapture is running).\n"
+                                  "It replaces what Windows would normally do with that key.")
+        self.hotkey_combo = QComboBox()
+        self.hotkey_combo.setEditable(True)
+        self.hotkey_combo.addItems(["print screen", "ctrl+print screen", "ctrl+shift+x", "ctrl+alt+s", "f8"])
+        self.hotkey_combo.setEditText(self.prefs.get("hotkey", "print screen"))
+        self.hotkey_combo.setMinimumWidth(140)
+        self.hotkey_combo.lineEdit().editingFinished.connect(self._hotkey_changed)
+        self.hotkey_combo.textActivated.connect(lambda _t: self._hotkey_changed())
+        self.hotkey_cb.setChecked(self.prefs.get("hotkey_enabled", False))
+        self.hotkey_cb.toggled.connect(self._hotkey_toggled)
+        row2.addWidget(self.hotkey_cb)
+        row2.addWidget(self.hotkey_combo)
+        row2.addSpacing(14)
+        self.tray_cb = QCheckBox("Keep running in the tray when closed")
+        self.tray_cb.setToolTip("Closing the window leaves Auto-Scapture in the system tray so the screenshot key keeps working.\n"
+                                "Right-click the tray icon to quit.")
+        self.tray_cb.setChecked(self.prefs.get("run_in_background", False))
+        self.tray_cb.toggled.connect(self._tray_toggled)
+        row2.addWidget(self.tray_cb)
+        self.autostart_cb = QCheckBox("Start with Windows")
+        frozen = getattr(sys, "frozen", False)
+        self.autostart_cb.setEnabled(frozen)
+        self.autostart_cb.setToolTip("Start Auto-Scapture in the tray when you sign in to Windows" if frozen
+                                     else "Available in the .exe version")
+        self.autostart_cb.setChecked(frozen and autostart_enabled())
+        self.autostart_cb.toggled.connect(self._autostart_toggled)
+        row2.addWidget(self.autostart_cb)
+        row2.addStretch()
+        tb.addLayout(row2)
+        root.addWidget(take_box)
+
+        # --- folder bar ---
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(QLabel("Folder:"))
+        self.folder_edit = QLineEdit(self.folder)
+        self.folder_edit.setReadOnly(True)
+        folder_row.addWidget(self.folder_edit, 1)
+        folder_row.addWidget(make_button("Change...", self.choose_folder))
+        default_btn = make_button("Windows Default", self.use_default_folder)
+        default_btn.setToolTip("Use the folder Windows' own screenshot tools save to")
+        folder_row.addWidget(default_btn)
+        folder_row.addWidget(make_button("Open in Explorer", lambda: os.path.isdir(self.folder) and os.startfile(self.folder)))
+        self.subfolders_cb = QCheckBox("Include subfolders")
+        self.subfolders_cb.setChecked(self.prefs.get("include_subfolders", False))
+        self.subfolders_cb.toggled.connect(lambda v: (self._set_pref("include_subfolders", v), self.refresh()))
+        folder_row.addWidget(self.subfolders_cb)
+        organize_btn = make_button("Organize by Month...", self.organize_by_month, bg="#ece3f7")
+        organize_btn.setToolTip("Move loose screenshots into YYYY-MM folders")
+        folder_row.addWidget(organize_btn)
+        root.addLayout(folder_row)
+
+        # --- filter bar ---
+        filter_row = QHBoxLayout()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search by name...")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.textChanged.connect(lambda _t: self._filter_timer.start())
+        filter_row.addWidget(self.search_edit, 1)
+        self.date_combo = QComboBox()
+        self.date_combo.addItems(["All dates", "Today", "Last 7 days", "Last 30 days", "Older than 30 days"])
+        self.date_combo.setCurrentText(self.prefs.get("date_filter", "All dates"))
+        self.date_combo.currentTextChanged.connect(lambda t: (self._set_pref("date_filter", t), self.apply_filter()))
+        filter_row.addWidget(self.date_combo)
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItems(["Newest first", "Oldest first", "Largest first", "Name"])
+        self.sort_combo.setCurrentText(self.prefs.get("sort", "Newest first"))
+        self.sort_combo.currentTextChanged.connect(lambda t: (self._set_pref("sort", t), self.apply_filter()))
+        filter_row.addWidget(self.sort_combo)
+        filter_row.addWidget(make_button("Refresh", self.refresh))
+        self.count_lbl = QLabel("")
+        self.count_lbl.setStyleSheet("color: #6b7280;")
+        filter_row.addWidget(self.count_lbl)
+        root.addLayout(filter_row)
+
+        # --- gallery + details ---
+        split = QSplitter(Qt.Horizontal)
+        self.gallery = QListWidget()
+        self.gallery.setViewMode(QListView.IconMode)
+        self.gallery.setResizeMode(QListView.Adjust)
+        self.gallery.setMovement(QListView.Static)
+        self.gallery.setIconSize(self.THUMB)
+        self.gallery.setGridSize(QSize(self.THUMB.width() + 20, self.THUMB.height() + 40))
+        self.gallery.setUniformItemSizes(True)
+        self.gallery.setWordWrap(False)
+        self.gallery.setTextElideMode(Qt.ElideMiddle)
+        self.gallery.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.gallery.setSpacing(4)
+        self.gallery.itemDoubleClicked.connect(lambda _i: self.open_selected())
+        self.gallery.currentItemChanged.connect(lambda *_: self.update_preview())
+        self.gallery.itemSelectionChanged.connect(self._update_action_states)
+        self.gallery.verticalScrollBar().valueChanged.connect(lambda _v: self._visible_timer.start())
+        QShortcut(QKeySequence.Delete, self.gallery, self.delete_selected, context=Qt.WidgetShortcut)
+        QShortcut(QKeySequence.Copy, self.gallery, self.copy_selected, context=Qt.WidgetShortcut)
+        QShortcut(QKeySequence("F2"), self.gallery, self.rename_selected, context=Qt.WidgetShortcut)
+        split.addWidget(self.gallery)
+
+        side = QWidget()
+        sl = QVBoxLayout(side)
+        sl.setContentsMargins(8, 0, 0, 0)
+        self.preview = QLabel("Select a screenshot")
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setMinimumSize(260, 170)
+        self.preview.setStyleSheet("background: #1f2937; color: #9ca3af; border-radius: 8px;")
+        sl.addWidget(self.preview, 1)
+        self.info_lbl = QLabel("")
+        self.info_lbl.setWordWrap(True)
+        self.info_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        sl.addWidget(self.info_lbl)
+        actions = QGridLayout()
+        self.act_buttons = {}
+        for i, (name, slot, bg, fg) in enumerate([
+                ("Open", self.open_selected, None, None), ("Copy", self.copy_selected, None, None),
+                ("Show in Folder", self.show_in_folder, None, None), ("Rename", self.rename_selected, None, None),
+                ("Edit / Redact", self.edit_selected, "#ffd9b3", None), ("Add to Session", self.add_to_session, "#cfe2f3", None),
+                ("Move To...", self.move_selected, None, None), ("Delete", self.delete_selected, None, "red")]):
+            b = make_button(name, slot, bg=bg, fg=fg)
+            self.act_buttons[name] = b
+            actions.addWidget(b, i // 2, i % 2)
+        self.act_buttons["Add to Session"].setToolTip("Add to the Auto-Scapture session (for Review, PDF and Markdown)")
+        self.act_buttons["Delete"].setToolTip("Move to the Recycle Bin  (Delete key)")
+        sl.addLayout(actions)
+        split.addWidget(side)
+        split.setStretchFactor(0, 1)
+        split.setSizes([800, 300])
+        root.addWidget(split, 1)
+
+        # timers / watchers
+        self._filter_timer = QTimer(self, singleShot=True, interval=200, timeout=self.apply_filter)
+        self._visible_timer = QTimer(self, singleShot=True, interval=60, timeout=self._request_visible_thumbs)
+        self._refresh_timer = QTimer(self, singleShot=True, interval=600, timeout=self.refresh)
+        self.watcher = QFileSystemWatcher(self)
+        self.watcher.directoryChanged.connect(lambda _p: self._refresh_timer.start())
+
+        self._update_action_states()
+        self._loaded = False
+        if self.hotkey_cb.isChecked():
+            self._register_hotkey()
+
+    # ---------------- prefs ----------------
+    def _set_pref(self, key, value):
+        self.prefs[key] = value
+        self.app.save_settings()
+
+    # ---------------- folder listing ----------------
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._loaded:
+            self._loaded = True
+            QTimer.singleShot(0, self.refresh)
+        else:
+            self._visible_timer.start()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._visible_timer.start()
+
+    def set_folder(self, folder):
+        self.folder = os.path.normpath(folder)
+        self.folder_edit.setText(self.folder)
+        self._set_pref("folder", self.folder)
+        self.refresh()
+
+    def choose_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Screenshots Folder", self.folder if os.path.isdir(self.folder) else "")
+        if folder:
+            self.set_folder(folder)
+
+    def use_default_folder(self):
+        self.set_folder(windows_screenshots_folder())
+
+    def refresh(self):
+        entries = []
+        if os.path.isdir(self.folder):
+            stack = [self.folder]
+            while stack:
+                d = stack.pop()
+                try:
+                    with os.scandir(d) as it:
+                        for e in it:
+                            if e.is_dir(follow_symlinks=False):
+                                if self.subfolders_cb.isChecked():
+                                    stack.append(e.path)
+                            elif e.name.lower().endswith(GALLERY_EXTS):
+                                st = e.stat()
+                                entries.append((os.path.normpath(e.path), st.st_mtime, st.st_size))
+                except OSError:
+                    pass
+            if self.folder not in self.watcher.directories():
+                if self.watcher.directories():
+                    self.watcher.removePaths(self.watcher.directories())
+                self.watcher.addPath(self.folder)
+        self.entries = entries
+        self.apply_filter()
+
+    def _filtered(self):
+        now = time.time()
+        day = 86400
+        start_of_today = datetime.datetime.combine(datetime.date.today(), datetime.time()).timestamp()
+        date_filter = self.date_combo.currentText()
+        needle = self.search_edit.text().strip().lower()
+        out = []
+        for path, mtime, size in self.entries:
+            if date_filter == "Today" and mtime < start_of_today: continue
+            if date_filter == "Last 7 days" and mtime < now - 7 * day: continue
+            if date_filter == "Last 30 days" and mtime < now - 30 * day: continue
+            if date_filter == "Older than 30 days" and mtime >= now - 30 * day: continue
+            if needle and needle not in os.path.basename(path).lower(): continue
+            out.append((path, mtime, size))
+        sort = self.sort_combo.currentText()
+        if sort == "Newest first": out.sort(key=lambda e: e[1], reverse=True)
+        elif sort == "Oldest first": out.sort(key=lambda e: e[1])
+        elif sort == "Largest first": out.sort(key=lambda e: e[2], reverse=True)
+        else: out.sort(key=lambda e: os.path.basename(e[0]).lower())
+        return out
+
+    def apply_filter(self, select_path=None):
+        selected = select_path or (self.gallery.currentItem().data(Qt.UserRole) if self.gallery.currentItem() else None)
+        shown = self._filtered()
+        self.generation += 1
+        self.pending.clear()
+        self.gallery.setUpdatesEnabled(False)
+        self.gallery.clear()
+        self.items = {}
+        placeholder_icon = QIcon(self.placeholder)
+        for path, mtime, size in shown:
+            item = QListWidgetItem(self.thumbs.get(path) and QIcon(self.thumbs[path]) or placeholder_icon, os.path.basename(path))
+            item.setData(Qt.UserRole, path)
+            item.setToolTip(f"{os.path.basename(path)}\n{datetime.datetime.fromtimestamp(mtime):%Y-%m-%d %H:%M}  •  {size / 1e6:.1f} MB")
+            self.gallery.addItem(item)
+            self.items[path] = item
+        self.gallery.setUpdatesEnabled(True)
+        total_mb = sum(e[2] for e in self.entries) / 1e6
+        if not os.path.isdir(self.folder):
+            self.count_lbl.setText("Folder not found - take a screenshot to create it")
+        elif len(shown) == len(self.entries):
+            self.count_lbl.setText(f"{len(shown):,} screenshots  •  {total_mb:,.1f} MB")
+        else:
+            self.count_lbl.setText(f"{len(shown):,} of {len(self.entries):,} screenshots  •  {total_mb:,.1f} MB total")
+        if selected in self.items:
+            self.gallery.setCurrentItem(self.items[selected])
+            self.gallery.scrollToItem(self.items[selected])
+        self.update_preview()
+        self._update_action_states()
+        self._visible_timer.start()
+
+    # ---------------- thumbnails (only for what's on screen) ----------------
+    def _request_visible_thumbs(self):
+        if not self.isVisible() or not self.items:
+            return
+        view = self.gallery.viewport().rect().adjusted(0, -self.THUMB.height() * 2, 0, self.THUMB.height() * 2)
+        for path, item in self.items.items():
+            if path in self.thumbs or path in self.pending:
+                continue
+            if self.gallery.visualItemRect(item).intersects(view):
+                self.pending.add(path)
+                self.pool.start(_ThumbJob(self.generation, path, self.THUMB, self.thumb_signals))
+
+    def _on_thumb(self, generation, path, image):
+        self.pending.discard(path)
+        if image.isNull():
+            return
+        pix = QPixmap.fromImage(image)
+        self.thumbs[path] = pix
+        self.thumbs.move_to_end(path)
+        while len(self.thumbs) > self.CACHE_LIMIT:
+            old_path, _ = self.thumbs.popitem(last=False)
+            if old_path in self.items:
+                self.items[old_path].setIcon(QIcon(self.placeholder))
+        if path in self.items:
+            self.items[path].setIcon(QIcon(pix))
+
+    def _forget_thumbs(self, paths):
+        for pth in paths:
+            self.thumbs.pop(pth, None)
+
+    # ---------------- selection / preview ----------------
+    def selected_paths(self):
+        return [it.data(Qt.UserRole) for it in self.gallery.selectedItems()]
+
+    def _update_action_states(self):
+        n = len(self.selected_paths())
+        for name, b in self.act_buttons.items():
+            single = name in ("Copy", "Rename", "Show in Folder")
+            b.setEnabled(n == 1 if single else n >= 1)
+
+    def update_preview(self):
+        item = self.gallery.currentItem()
+        if item is None:
+            self.preview.setPixmap(QPixmap())
+            self.preview.setText("Select a screenshot")
+            self.info_lbl.setText("")
+            return
+        path = item.data(Qt.UserRole)
+        reader = QImageReader(path)
+        reader.setAutoTransform(True)
+        full = reader.size()
+        target = self.preview.size() - QSize(10, 10)
+        if full.isValid():
+            reader.setScaledSize(full.scaled(target, Qt.KeepAspectRatio) if (full.width() > target.width() or full.height() > target.height()) else full)
+        img = reader.read()
+        if img.isNull():
+            self.preview.setPixmap(QPixmap())
+            self.preview.setText("Can't preview this file")
+        else:
+            self.preview.setPixmap(QPixmap.fromImage(img))
+        try:
+            st = os.stat(path)
+            dims = f"{full.width()} × {full.height()} px  •  " if full.isValid() else ""
+            self.info_lbl.setText(f"<b>{os.path.basename(path)}</b><br>{dims}{st.st_size / 1e6:.2f} MB<br>"
+                                  f"{datetime.datetime.fromtimestamp(st.st_mtime):%A %d %B %Y, %H:%M}")
+        except OSError:
+            self.info_lbl.setText(os.path.basename(path))
+
+    # ---------------- actions ----------------
+    def open_selected(self):
+        for path in self.selected_paths()[:10]:
+            os.startfile(path)
+
+    def copy_selected(self):
+        paths = self.selected_paths()
+        if len(paths) == 1:
+            QApplication.clipboard().setImage(QImage(paths[0]))
+            self.app.show_toast(os.path.basename(paths[0]), 0, None, title_text="Copied to clipboard")
+
+    def show_in_folder(self):
+        paths = self.selected_paths()
+        if paths:
+            import subprocess
+            subprocess.Popen(["explorer", "/select,", paths[0]])
+
+    def rename_selected(self):
+        paths = self.selected_paths()
+        if len(paths) != 1: return
+        old = paths[0]
+        base, ext = os.path.splitext(os.path.basename(old))
+        new_base, ok = QInputDialog.getText(self, "Rename Screenshot", "New name:", text=base)
+        new_base = (new_base or "").strip()
+        if not ok or not new_base or new_base == base: return
+        if any(c in new_base for c in '\\/:*?"<>|'):
+            warn(self, "Invalid Name", 'A file name can\'t contain any of these characters:  \\ / : * ? " < > |')
+            return
+        new = os.path.join(os.path.dirname(old), new_base + ext)
+        if os.path.exists(new):
+            warn(self, "Name Taken", f"'{new_base + ext}' already exists.")
+            return
+        try:
+            os.rename(old, new)
+        except OSError as e:
+            error(self, "Rename Failed", str(e))
+            return
+        self._replace_path(old, new)
+        self.refresh_keep(new)
+
+    def _replace_path(self, old, new):
+        if old in self.thumbs:
+            self.thumbs[new] = self.thumbs.pop(old)
+        if old in self.app.session_images:
+            self.app.session_images[self.app.session_images.index(old)] = new
+
+    def refresh_keep(self, select_path=None):
+        self.refresh()
+        if select_path and select_path in self.items:
+            self.gallery.clearSelection()
+            self.gallery.setCurrentItem(self.items[select_path])
+
+    def edit_selected(self):
+        paths = self.selected_paths()
+        if not paths: return
+        def after():
+            self._forget_thumbs(paths)
+            self.apply_filter()
+        self.app.launch_manual_redaction(paths, self.app, after)
+
+    def add_to_session(self):
+        added = [pth for pth in self.selected_paths() if pth not in self.app.session_images]
+        self.app.session_images.extend(added)
+        self.app.update_session_label()
+        info(self, "Added to Session", f"Added {len(added)} screenshot(s) to the Auto-Scapture session.\n\n"
+                                       "Use Review / Redact or Export on the Auto-Scapture tab.")
+
+    def move_selected(self):
+        paths = self.selected_paths()
+        if not paths: return
+        dest = QFileDialog.getExistingDirectory(self, "Move Screenshots To", self.folder)
+        if not dest: return
+        moved = 0
+        for pth in paths:
+            if os.path.normcase(os.path.dirname(pth)) == os.path.normcase(os.path.normpath(dest)):
+                continue
+            try:
+                new = unique_path(dest, os.path.basename(pth))
+                shutil.move(pth, new)
+                self._replace_path(pth, new)
+                moved += 1
+            except OSError as e:
+                warn(self, "Move Failed", f"{os.path.basename(pth)}:\n{e}")
+        self.refresh()
+        info(self, "Moved", f"Moved {moved} screenshot(s) to:\n{dest}")
+
+    def delete_selected(self):
+        paths = self.selected_paths()
+        if not paths: return
+        if not ask_yes_no(self, "Delete Screenshots", f"Move {len(paths)} screenshot(s) to the Recycle Bin?"):
+            return
+        if not send_to_recycle_bin(paths):
+            warn(self, "Delete", "Some screenshots were not deleted.")
+        self._forget_thumbs(paths)
+        self.refresh()
+
+    def organize_by_month(self):
+        if not os.path.isdir(self.folder): return
+        loose = [(pth, mt) for pth, mt, _sz in self.entries if os.path.normcase(os.path.dirname(pth)) == os.path.normcase(self.folder)]
+        if not loose:
+            info(self, "Organize by Month", "There are no loose screenshots to organize.")
+            return
+        months = sorted({datetime.datetime.fromtimestamp(mt).strftime("%Y-%m") for _p, mt in loose})
+        if not ask_yes_no(self, "Organize by Month",
+                          f"Move {len(loose):,} screenshot(s) into {len(months)} month folder(s) inside:\n{self.folder}\n\n"
+                          f"({months[0]} ... {months[-1]})\n\nNothing is deleted. Continue?"):
+            return
+        moved = 0
+        for pth, mt in loose:
+            dest = os.path.join(self.folder, datetime.datetime.fromtimestamp(mt).strftime("%Y-%m"))
+            try:
+                os.makedirs(dest, exist_ok=True)
+                new = unique_path(dest, os.path.basename(pth))
+                shutil.move(pth, new)
+                self._replace_path(pth, new)
+                moved += 1
+            except OSError:
+                pass
+        self.subfolders_cb.setChecked(True)  # keep them visible (also refreshes)
+        info(self, "Organize by Month", f"Moved {moved:,} screenshot(s) into month folders.")
+
+    # ---------------- taking screenshots ----------------
+    def delay_seconds(self):
+        text = self.delay_combo.currentText()
+        return int(text.split()[0]) if text[0].isdigit() else 0
+
+    def take(self, kind="snip", delay=None):
+        if self._busy:
+            return
+        self._busy = True
+        delay = self.delay_seconds() if delay is None else delay
+        if delay > 0:
+            self._countdown(delay, kind)
+        else:
+            self._begin(kind)
+
+    def _countdown(self, remaining, kind):
+        if remaining <= 0:
+            if getattr(self, "_count_toast", None):
+                self._count_toast.close()
+                self._count_toast = None
+            QTimer.singleShot(150, lambda: self._begin(kind))
+            return
+        if not getattr(self, "_count_toast", None):
+            t = QLabel()
+            t.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | Qt.WindowDoesNotAcceptFocus)
+            t.setAttribute(Qt.WA_ShowWithoutActivating)
+            t.setStyleSheet("background: #1f2937; color: white; padding: 10px 18px; border-radius: 6px;")
+            f = QFont("Segoe UI", 12); f.setBold(True)
+            t.setFont(f)
+            self._count_toast = t
+        self._count_toast.setText(f"Screenshot in {remaining}...")
+        self._count_toast.adjustSize()
+        geo = QGuiApplication.primaryScreen().availableGeometry()
+        self._count_toast.move(geo.right() - self._count_toast.width() - 20, geo.bottom() - self._count_toast.height() - 20)
+        self._count_toast.show()
+        exclude_from_capture(self._count_toast)
+        QTimer.singleShot(1000, lambda: self._countdown(remaining - 1, kind))
+
+    def _begin(self, kind):
+        hide_self = self.app.hide_from_capture and self.app.isVisible()
+        if hide_self:
+            exclude_from_capture(self.app, True)  # screenshot what's behind Auto-Scapture
+        QTimer.singleShot(150 if hide_self else 0, lambda: self._grab(kind))
+
+    def _grab(self, kind):
+        try:
+            if kind == "snip":
+                self.session = ScreenshotSession()
+                self.session.captured.connect(self._on_shot)
+                self.session.cancelled.connect(self._on_cancel)
+                self.session.start()
+            elif kind == "screen":
+                self._on_shot(ImageGrab.grab(bbox=monitor_rect_at(cursor_pos_physical()), all_screens=True))
+            else:
+                self._on_shot(ImageGrab.grab(all_screens=True))
+        except Exception as e:
+            self._busy = False
+            error(self, "Screenshot Failed", str(e))
+        finally:
+            self.app.apply_capture_exclusion()
+
+    def _on_cancel(self):
+        self._busy = False
+        self.session = None
+
+    def _on_shot(self, img):
+        self._busy = False
+        self.session = None
+        try:
+            os.makedirs(self.folder, exist_ok=True)
+            path = unique_path(self.folder, time.strftime("Screenshot %Y-%m-%d %H%M%S.png"))
+            img.save(path)
+        except OSError as e:
+            error(self, "Screenshot Not Saved", f"Couldn't save to:\n{self.folder}\n\n{e}")
+            return
+        copied = self.clip_cb.isChecked()
+        if copied:
+            QApplication.clipboard().setImage(pil_to_pixmap(img).toImage())
+        self.last_shot = path
+        self.app.show_toast(os.path.basename(path), 0, img,
+                            title_text="Screenshot saved" + (" & copied" if copied else ""))
+        self.refresh_keep(os.path.normpath(path))
+
+    # ---------------- global key / tray / autostart ----------------
+    def _register_hotkey(self):
+        self._unregister_hotkey()
+        hk = self.hotkey_combo.currentText().strip().lower()
+        if not hk:
+            return
+        try:
+            # suppress=True so Windows (e.g. its own Print Screen handler) doesn't also react
+            self._hotkey_handle = keyboard.add_hotkey(hk, lambda: self.app.ui_call(lambda: self.take("snip", delay=0)), suppress=True)
+        except (ValueError, ImportError) as e:
+            self._hotkey_handle = None
+            self.hotkey_cb.blockSignals(True)
+            self.hotkey_cb.setChecked(False)
+            self.hotkey_cb.blockSignals(False)
+            warn(self, "Screenshot Key", f"'{hk}' can't be used as a screenshot key:\n{e}")
+
+    def _unregister_hotkey(self):
+        if self._hotkey_handle is not None:
+            try: keyboard.remove_hotkey(self._hotkey_handle)
+            except (KeyError, ValueError): pass
+            self._hotkey_handle = None
+
+    def _hotkey_toggled(self, on):
+        self._set_pref("hotkey_enabled", on)
+        if on:
+            if self.hotkey_combo.currentText().strip().lower() == self.app.hotkey_combo.currentText().strip().lower():
+                warn(self, "Screenshot Key", "This is also your Auto-Scapture capture hotkey - pick a different key.")
+                self.hotkey_cb.setChecked(False)
+                return
+            self._register_hotkey()
+        else:
+            self._unregister_hotkey()
+
+    def _hotkey_changed(self):
+        self._set_pref("hotkey", self.hotkey_combo.currentText().strip().lower())
+        if self.hotkey_cb.isChecked():
+            self._register_hotkey()
+
+    def _tray_toggled(self, on):
+        self._set_pref("run_in_background", on)
+        self.app.update_tray()
+
+    def _autostart_toggled(self, on):
+        try:
+            set_autostart(on)
+        except OSError as e:
+            warn(self, "Start with Windows", f"Couldn't change the startup setting:\n{e}")
+        if on and not self.tray_cb.isChecked():
+            self.tray_cb.setChecked(True)  # starting hidden only makes sense with the tray icon
+
+    def shutdown(self):
+        self._unregister_hotkey()
+        self.pool.clear()
+
+
+# ==========================================
 # --- MAIN APPLICATION ---
 # ==========================================
 class ScreenCaptureApp(QWidget):
@@ -1334,6 +2300,10 @@ class ScreenCaptureApp(QWidget):
 
         self.renamer_extensions = prefs.get("renamer_extensions", [".txt", ".cfg", ".csv", ".json", ".md", ".log"])
         self.video_chapters = self.settings_data.get("video_chapters", {})
+        self.shot_prefs = self.settings_data.get("screenshots", {})
+        self.tray = None
+        self._quitting = False
+        self._tray_hint_shown = False
 
         # ==========================================
         # --- TABBED INTERFACE ---
@@ -1365,6 +2335,8 @@ class ScreenCaptureApp(QWidget):
 
         self.setup_capture_ui()
         self.setup_renamer_ui()
+        self.shots_tab = ScreenshotsTab(self)
+        self.notebook.insertTab(1, self.shots_tab, "Screenshots")
 
         self.video_tab = None
         if VIDEO_AVAILABLE:
@@ -1399,6 +2371,7 @@ class ScreenCaptureApp(QWidget):
         if prefs.get("pinned", False):
             self.pin_btn.setChecked(True)
         self.apply_capture_exclusion()
+        self.update_tray()
 
     def apply_capture_exclusion(self):
         # Only hide the window while a capture is running, so screen sharing (Discord, Teams, OBS)
@@ -2426,6 +3399,7 @@ class ScreenCaptureApp(QWidget):
         data = {
             "presets": self.presets,
             "video_chapters": self.video_chapters,
+            "screenshots": self.shot_prefs,
             "window_geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
             "view_geometries": self._view_geoms,
             "preferences": {
@@ -2682,7 +3656,7 @@ class ScreenCaptureApp(QWidget):
                 self.video_tab.open_video(videos[0])
             else:
                 info(self, "Not a Video", "Drop a video file (MP4, MKV, MOV, AVI, WEBM...) to open it.")
-        elif self.notebook.currentIndex() == 1:
+        elif self.notebook.currentWidget() is self.rename_tab:
             added = [p for p in paths if p not in self.rename_files_list]
             self.rename_files_list.extend(added)
             self.refresh_renamer_main_list()
@@ -3413,7 +4387,7 @@ class ScreenCaptureApp(QWidget):
 
         redact_win.show()
 
-    def show_toast(self, filename, session_index, img=None, flagged=False):
+    def show_toast(self, filename, session_index, img=None, flagged=False, title_text=None):
         # Frameless, always-on-top, never takes focus (so auto modes keep sending keys to the slideshow)
         # and hidden from screenshots so it can never end up inside a capture.
         toast = QWidget(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | Qt.WindowDoesNotAcceptFocus)
@@ -3437,7 +4411,7 @@ class ScreenCaptureApp(QWidget):
             row.addWidget(pic)
         col = QVBoxLayout()
         col.setSpacing(2)
-        title = QLabel(f"Captured #{session_index}" + ("  -  possible duplicate" if flagged else ""))
+        title = QLabel(title_text or (f"Captured #{session_index}" + ("  -  possible duplicate" if flagged else "")))
         f = QFont("Segoe UI", 11); f.setBold(True)
         title.setFont(f)
         title.setStyleSheet("color: #fbbf24;" if flagged else "color: #4ade80;")
@@ -3617,7 +4591,53 @@ class ScreenCaptureApp(QWidget):
             return
         info(self, "Markdown Exported", f"Saved {len(self.session_images)} steps to:\n{md_path}\n\nThe session is kept, so you can still export a PDF.")
 
+    # ---------------- system tray (keeps the screenshot key alive) ----------------
+    def update_tray(self):
+        if self.shot_prefs.get("run_in_background", False):
+            if self.tray is None:
+                self.tray = QSystemTrayIcon(self.windowIcon(), self)
+                self.tray.setToolTip("Auto-Scapture")
+                menu = QMenu()
+                for text, slot in [("Snip (area or window)", lambda: self.shots_tab.take("snip", delay=0)),
+                                   ("Full Screen", lambda: self.shots_tab.take("screen", delay=0)),
+                                   ("Open Auto-Scapture", self.show_from_tray)]:
+                    act = QAction(text, menu)
+                    act.triggered.connect(slot)
+                    menu.addAction(act)
+                menu.addSeparator()
+                quit_act = QAction("Quit", menu)
+                quit_act.triggered.connect(self.quit_app)
+                menu.addAction(quit_act)
+                self._tray_menu = menu
+                self.tray.setContextMenu(menu)
+                self.tray.activated.connect(lambda reason: reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick) and self.show_from_tray())
+            self.tray.show()
+        elif self.tray is not None:
+            self.tray.hide()
+
+    def show_from_tray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def quit_app(self):
+        self._quitting = True
+        self.close()
+        QApplication.quit()
+
     def closeEvent(self, event):
+        if self.tray is not None and self.tray.isVisible() and not self._quitting:
+            # keep running in the tray so the screenshot key still works
+            self.save_settings()
+            event.ignore()
+            self.hide()
+            if not self._tray_hint_shown:
+                self._tray_hint_shown = True
+                self.tray.showMessage("Auto-Scapture is still running",
+                                      "Your screenshot key keeps working. Right-click the tray icon to quit.",
+                                      QSystemTrayIcon.Information, 4000)
+            return
+        self.shots_tab.shutdown()
         if self.video_tab is not None:
             self.video_tab.shutdown()
         self.save_settings()
@@ -3631,7 +4651,10 @@ def main():
     app = QApplication(sys.argv)
     apply_light_theme(app)
     window = ScreenCaptureApp()
-    window.show()
+    if "--tray" in sys.argv and window.tray is not None:
+        pass  # started with Windows: stay in the tray until needed
+    else:
+        window.show()
     sys.exit(app.exec())
 
 

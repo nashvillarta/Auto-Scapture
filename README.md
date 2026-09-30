@@ -38,7 +38,15 @@ The core architecture of the application includes the following:
 * **Drag & Drop:** Drop images onto the window to add them to the session, or files onto the Lab Renamer tab.
 * **Area Presets:** Save and recall specific bounding box coordinates on your screen.
 
-## III. Video Capture
+## III. Screenshots
+A replacement for Win+Shift+S / Snipping Tool, plus a manager for the Screenshots folder that fills up over time:
+* **Snip:** The screen freezes and dims - drag to capture an area, or click a window to capture just that window (any monitor). F = this screen, A = all screens, Esc = cancel. Full Screen / All Monitors buttons and an optional 3/5/10 s delay are also available.
+* **Screenshot Key:** Turn on a global key (Print Screen by default) that snips from anywhere and takes over from the Windows tool. Optionally keep Auto-Scapture running in the system tray when closed, and start it with Windows.
+* **Saved & Copied:** Every screenshot is saved to your Windows Screenshots folder (the same one Snipping Tool uses, even if it was moved or is on OneDrive) and copied to the clipboard.
+* **Screenshots Gallery:** Browse that folder (newest first, live-updating) with search, date filters (Today / Last 7 days / Last 30 days / Older) and a preview. Open, copy, rename, redact, move, add to your capture session, or delete (always to the Recycle Bin).
+* **Organize by Month:** One click files loose screenshots into `YYYY-MM` folders.
+
+## IV. Video Capture
 A built-in media player tab for pulling documentation screenshots out of recordings:
 * **Scrub & Step:** Play/pause, a seek bar you can click anywhere on, +/- 5 s jumps, playback speed, and exact frame-by-frame stepping (Left/Right arrows).
 * **Audio Loudness Chart:** A waveform of the video's audio under the seek bar shows loud and quiet parts at a glance; click it to jump there. Uses Qt's FFmpeg backend with hardware video decoding where your device supports it; works with MP4, MOV (incl. iPhone HEVC), MKV, WEBM and AVI.
@@ -47,7 +55,7 @@ A built-in media player tab for pulling documentation screenshots out of recordi
 
 Keyboard: Space = play/pause, Left/Right = previous/next frame, Shift+Left/Right = -/+ 5 s, C = capture frame, M = add timestamp.
 
-## IV. Lab Renamer
+## V. Lab Renamer
 To expand the functionality for lab environments, a secondary module was implemented:
 * **Bulk Sequential Renamer:** Load `.txt`, `.cfg`, or `.csv` files, preview their contents, and rename them sequentially in bulk.
 * **Context Naming:** Tick "Context Naming" and the app peeks inside files to find "Title" or "Experiment" headers and renames the file accordingly.
@@ -55,6 +63,6 @@ To expand the functionality for lab environments, a secondary module was impleme
 * **Format Conversion:** Manually edit or automatically batch-convert file extensions.
 * **File Merger:** Combine multiple text or config files into one large master document, complete with generated visual dividers.
 
-## V. Notes & Reflection
+## VI. Notes & Reflection
 * The application is built entirely in Python using `PySide6` (Qt) for the GUI (migrated from `Tkinter`), `keyboard` for global hotkeys, and `Pillow` for image processing.
 * The program compiles with PyInstaller (`build_exe.ps1`) into a single standalone `.exe` for daily use.
